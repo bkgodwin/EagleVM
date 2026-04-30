@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}VM Classroom{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <header class="topbar">
+        <a class="brand" href="{{ url_for('user.dashboard') }}">VM Classroom</a>
+        <nav>
+            {% if current_user.is_authenticated %}
+                {% if current_user.is_admin %}
+                    <a href="{{ url_for('admin.dashboard') }}">Admin</a>
+                {% endif %}
+                <a href="{{ url_for('auth.change_password') }}">Password</a>
+                <a href="{{ url_for('auth.logout') }}">Logout</a>
+            {% endif %}
+        </nav>
+    </header>
+    {% if session.get("impersonated_by") %}
+        <form class="impersonation" method="post" action="{{ url_for('admin.stop_impersonating') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <span>Impersonating {{ current_user.email }}</span>
+            <button type="submit">Return to admin</button>
+        </form>
+    {% endif %}
+    <main class="page">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <section class="messages">
+                    {% for category, message in messages %}
+                        <div class="message {{ category }}">{{ message }}</div>
+                    {% endfor %}
+                </section>
+            {% endif %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

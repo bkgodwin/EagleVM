@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Admin · VM Classroom{% endblock %}
+{% block content %}
+<section class="admin-grid">
+    <div class="panel">
+        <h1>Admin dashboard</h1>
+        <p class="muted">Manage students, defaults, VM status, and launch impersonation.</p>
+    </div>
+    <div class="panel">
+        <h2>Defaults</h2>
+        <form method="post" action="{{ url_for('admin.update_settings') }}" class="compact-form">
+            {{ settings_form.hidden_tag() }}
+            <label>{{ settings_form.default_cpu.label }} {{ settings_form.default_cpu() }}</label>
+            <label>{{ settings_form.default_ram.label }} {{ settings_form.default_ram() }}</label>
+            <label>{{ settings_form.proxmox_host.label }} {{ settings_form.proxmox_host() }}</label>
+            <label>{{ settings_form.proxmox_node.label }} {{ settings_form.proxmox_node() }}</label>
+            <label>{{ settings_form.template_vm_id.label }} {{ settings_form.template_vm_id() }}</label>
+            {{ settings_form.submit(class="primary") }}
+        </form>
+    </div>
+    <div class="panel">
+        <h2>Import users</h2>
+        <form method="post" action="{{ url_for('admin.import_users') }}" enctype="multipart/form-data" class="compact-form">
+            {{ csv_form.hidden_tag() }}
+            <label>{{ csv_form.csv_file.label }} {{ csv_form.csv_file(accept=".csv,text/csv") }}</label>
+            {{ csv_form.submit(class="primary") }}
+        </form>
+    </div>
+    <div class="panel">
+        <h2>Create user</h2>
+        <form method="post" action="{{ url_for('admin.create_user') }}" class="compact-form">
+            {{ user_form.hidden_tag() }}
+            <label>{{ user_form.email.label }} {{ user_form.email() }}</label>
+            <label>{{ user_form.password.label }} {{ user_form.password() }}</label>
+            <label class="check">{{ user_form.is_admin() }} {{ user_form.is_admin.label.text }}</label>
+            {{ user_form.submit(class="primary") }}
+        </form>
+    </div>
+</section>
+<section class="panel wide">
+    <h2>Users and VMs</h2>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Email</th>
+                    <th>Role</th>
+                    <th>VM</th>
+                    <th>Status</th>
+                    <th>Resources</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for user in users %}
+                    <tr>
+                        <td>{{ user.email }}</td>
+                        <td>{{ "Admin" if user.is_admin else "Student" }}</td>
+                        <td>{{ user.vm_config.vm_id if user.vm_config else "None" }}</td>
+                        <td>{{ user.vm_config.status if user.vm_config else "Not created" }}</td>
+                        <td>
+                            <form method="post" action="{{ url_for('admin.update_resources', user_id=user.id) }}" class="inline-form">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input name="cpu" type="number" min="1" max="64" value="{{ user.vm_config.cpu if user.vm_config else user.override_cpu or settings.default_cpu }}">
+                                <input name="ram" type="number" min="1024" max="262144" value="{{ user.vm_config.ram if user.vm_config else user.override_ram or settings.default_ram }}">
+                                <button type="submit" {% if user.is_admin %}disabled{% endif %}>Save</button>
+                            </form>
+                        </td>
+                        <td class="row-actions">
+                            <form method="post" action="{{ url_for('admin.refresh_user_status', user_id=user.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" {% if not user.vm_config %}disabled{% endif %}>Status</button>
+                            </form>
+                            <form method="post" action="{{ url_for('admin.reset_vm', user_id=user.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" class="danger" {% if not user.vm_config %}disabled{% endif %}>Reset</button>
+                            </form>
+                            <form method="post" action="{{ url_for('admin.impersonate', user_id=user.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" {% if user.is_admin %}disabled{% endif %}>Login as</button>
+                            </form>
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}

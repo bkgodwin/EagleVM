@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Viewer · VM Classroom{% endblock %}
+{% block content %}
+<section class="viewer-shell">
+    <div class="viewer-toolbar">
+        <div>
+            <strong>Windows VM {{ vm.vm_id }}</strong>
+            <span>{{ vm.status|title }}</span>
+        </div>
+        <button id="fullscreen-btn" type="button">Fullscreen</button>
+    </div>
+    <iframe id="guac-frame" src="{{ guac_url }}" allow="fullscreen; clipboard-read; clipboard-write"></iframe>
+</section>
+<script src="{{ url_for('static', filename='viewer.js') }}"></script>
+{% endblock %}
