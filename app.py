@@ -130,7 +130,7 @@ def prompt_for_proxmox_password() -> str:
             "Start once in an interactive terminal to save it, or set proxmox_root_password_encrypted in config.json."
         )
     password = getpass.getpass("Enter Proxmox root password: ")
-    if password == "":
+    if not password:
         raise RuntimeError("Proxmox root password cannot be empty.")
     return password
 
@@ -204,7 +204,7 @@ def ssh_cmd(remote: str, timeout: int = 60) -> str:
     finally:
         client.close()
     if exit_code:
-        raise RuntimeError(err or out or f"command failed: {remote}")
+        raise RuntimeError(err or out or f"remote command failed with exit code {exit_code}")
     return out
 
 
