@@ -31,6 +31,7 @@ function openTerminal(session) {
   wrap.hidden = false;
   containerName.textContent = `Container: ${session.hostname}`;
   containerIp.textContent = `IPv4: ${session.ip}`;
+  terminalEl.replaceChildren();
 
   const terminal = new Terminal({
     cursorBlink: true,
@@ -45,6 +46,8 @@ function openTerminal(session) {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${protocol}://${location.host}/ws/${session.session_id}`);
   socket.binaryType = "arraybuffer";
+  let resizeFrame = null;
+  let resizeTimer = null;
 
   function sendResize() {
     fit.fit();
@@ -58,10 +61,28 @@ function openTerminal(session) {
   }
 
   function scheduleResize() {
-    requestAnimationFrame(() => {
+    if (resizeFrame !== null) return;
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = null;
       sendResize();
-      setTimeout(sendResize, 75);
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(sendResize, 75);
     });
+  }
+
+  function cleanup() {
+    observer.disconnect();
+    window.removeEventListener("resize", scheduleResize);
+    window.removeEventListener("beforeunload", closeSocket);
+    clearTimeout(resizeTimer);
+    if (resizeFrame !== null) {
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = null;
+    }
+  }
+
+  function closeSocket() {
+    socket.close();
   }
 
   socket.addEventListener("open", () => {
@@ -72,6 +93,7 @@ function openTerminal(session) {
     terminal.write(typeof event.data === "string" ? event.data : new Uint8Array(event.data));
   });
   socket.addEventListener("close", () => {
+    cleanup();
     terminal.writeln("\\r\\nSession closed. Temporary container cleanup requested.");
   });
 
@@ -81,8 +103,9 @@ function openTerminal(session) {
     }
   });
   const observer = new ResizeObserver(scheduleResize);
-  observer.observe(terminalEl);
+  // Observe the stable wrapper so fit() does not retrigger the observer on xterm's own DOM updates.
+  observer.observe(wrap);
   window.addEventListener("resize", scheduleResize);
-  window.addEventListener("beforeunload", () => socket.close());
+  window.addEventListener("beforeunload", closeSocket);
   scheduleResize();
 }

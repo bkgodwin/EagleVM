@@ -8,14 +8,16 @@ import os
 import socket
 import secrets
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import paramiko
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.websockets import WebSocketState
 import uvicorn
 
 
@@ -27,7 +29,20 @@ LOCK_PATH = STATE_DIR / "sessions.lock"
 SECRET_KEY_PATH = STATE_DIR / "secret.key"
 PROXMOX_PASSWORD_KEY = "proxmox_root_password_encrypted"
 
-app = FastAPI(title="LXChoster")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_state()
+    await asyncio.to_thread(ensure_proxmox_password)
+    cleanup_task = asyncio.create_task(cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
+
+
+app = FastAPI(title="LXChoster", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("lxchoster")
@@ -294,6 +309,11 @@ async def index():
     return (BASE_DIR / "static" / "index.html").read_text()
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
+
+
 @app.post("/api/session")
 async def launch():
     cfg = load_config()
@@ -388,7 +408,20 @@ async def terminal(websocket: WebSocket, session_id: str):
                 data = await asyncio.to_thread(channel.recv, 4096)
                 if not data:
                     break
-                await websocket.send_bytes(data)
+                if (
+                    websocket.application_state != WebSocketState.CONNECTED
+                    or websocket.client_state != WebSocketState.CONNECTED
+                ):
+                    break
+                try:
+                    await websocket.send_bytes(data)
+                except RuntimeError:
+                    if (
+                        websocket.application_state != WebSocketState.CONNECTED
+                        or websocket.client_state != WebSocketState.CONNECTED
+                    ):
+                        break
+                    raise
                 continue
             if await asyncio.to_thread(channel.exit_status_ready):
                 break
@@ -396,7 +429,12 @@ async def terminal(websocket: WebSocket, session_id: str):
 
     async def ws_to_pty():
         while True:
-            msg = await websocket.receive()
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                break
+            if msg.get("type") != "websocket.receive":
+                break
             with StateLock():
                 state = read_state()
                 if session_id in state:
@@ -418,8 +456,19 @@ async def terminal(websocket: WebSocket, session_id: str):
                 except json.JSONDecodeError:
                     await asyncio.to_thread(channel.send, text.encode())
 
+    ws_task = asyncio.create_task(ws_to_pty())
+    pty_task = asyncio.create_task(pty_to_ws())
     try:
-        await asyncio.gather(pty_to_ws(), ws_to_pty())
+        completed_tasks, pending_tasks = await asyncio.wait(
+            {pty_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending_tasks:
+            task.cancel()
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        for task in completed_tasks:
+            exc = task.exception()
+            if exc and not isinstance(exc, WebSocketDisconnect):
+                raise exc
     except WebSocketDisconnect:
         pass
     finally:
@@ -444,13 +493,6 @@ async def cleanup_loop():
         except Exception:
             pass
         await asyncio.sleep(30)
-
-
-@app.on_event("startup")
-async def startup():
-    init_state()
-    await asyncio.to_thread(ensure_proxmox_password)
-    asyncio.create_task(cleanup_loop())
 
 
 if __name__ == "__main__":
