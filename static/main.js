@@ -103,6 +103,7 @@ function openTerminal(session) {
     }
   });
   const observer = new ResizeObserver(scheduleResize);
+  // Observe the stable wrapper so fit() does not retrigger the observer on xterm's own DOM updates.
   observer.observe(wrap);
   window.addEventListener("resize", scheduleResize);
   window.addEventListener("beforeunload", closeSocket);

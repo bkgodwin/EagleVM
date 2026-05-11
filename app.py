@@ -458,7 +458,7 @@ async def terminal(websocket: WebSocket, session_id: str):
         await asyncio.gather(*pending_tasks, return_exceptions=True)
         for task in completed_tasks:
             exc = task.exception()
-            if exc and not isinstance(exc, (WebSocketDisconnect, RuntimeError)):
+            if exc and not isinstance(exc, WebSocketDisconnect):
                 raise exc
     except WebSocketDisconnect:
         pass
