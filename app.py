@@ -1,19 +1,18 @@
 import asyncio
 import base64
 import fcntl
+import getpass
 import json
 import logging
 import os
-import pty
+import socket
 import secrets
-import signal
-import struct
-import subprocess
-import termios
 import time
 from pathlib import Path
 from typing import Any
 
+import paramiko
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,24 +24,39 @@ CONFIG_PATH = Path(os.environ.get("LXCHOSTER_CONFIG", BASE_DIR / "config.json"))
 STATE_DIR = Path(os.environ.get("LXCHOSTER_STATE_DIR", "/var/lib/lxchoster"))
 STATE_PATH = STATE_DIR / "sessions.json"
 LOCK_PATH = STATE_DIR / "sessions.lock"
+SECRET_KEY_PATH = STATE_DIR / "secret.key"
+PROXMOX_PASSWORD_KEY = "proxmox_root_password_encrypted"
 
 app = FastAPI(title="LXChoster")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("lxchoster")
+_PROXMOX_PASSWORD_CACHE: str | None = None
+_FERNET_CACHE: Fernet | None = None
 
 
 def load_config() -> dict[str, Any]:
     with CONFIG_PATH.open() as fh:
         cfg = json.load(fh)
     cfg.setdefault("ssh_user", "root")
-    cfg.setdefault("ssh_key_path", "/opt/lxchoster/.ssh/id_ed25519")
+    cfg.setdefault("ssh_known_hosts_path", str(BASE_DIR / "known_hosts"))
+    cfg.setdefault(PROXMOX_PASSWORD_KEY, "")
     cfg.setdefault("storage", "local-lvm")
     cfg.setdefault("bridge", "vmbr0")
     cfg.setdefault("max_sessions", 25)
     cfg.setdefault("session_ttl_seconds", 3600)
     cfg.setdefault("boot_timeout_seconds", 90)
     return cfg
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    payload = json.dumps(cfg, indent=2, sort_keys=True) + "\n"
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(payload)
+    tmp.replace(CONFIG_PATH)
+    os.chmod(CONFIG_PATH, 0o600)
 
 
 def init_state() -> None:
@@ -77,30 +91,131 @@ def write_state(state: dict[str, Any]) -> None:
     tmp.replace(STATE_PATH)
 
 
+def get_fernet() -> Fernet:
+    global _FERNET_CACHE
+    if _FERNET_CACHE is not None:
+        return _FERNET_CACHE
+    init_state()
+    if SECRET_KEY_PATH.exists():
+        key = SECRET_KEY_PATH.read_bytes()
+    else:
+        key = Fernet.generate_key()
+        tmp = SECRET_KEY_PATH.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(key)
+        tmp.replace(SECRET_KEY_PATH)
+    os.chmod(SECRET_KEY_PATH, 0o600)
+    _FERNET_CACHE = Fernet(key)
+    return _FERNET_CACHE
+
+
+def encrypt_secret(value: str) -> str:
+    return get_fernet().encrypt(value.encode()).decode()
+
+
+def decrypt_secret(value: str) -> str:
+    try:
+        return get_fernet().decrypt(value.encode()).decode()
+    except InvalidToken as exc:
+        raise RuntimeError(
+            "Failed to decrypt stored Proxmox root password. "
+            "If needed, clear proxmox_root_password_encrypted in config.json and restart to re-enter it."
+        ) from exc
+
+
+def prompt_for_proxmox_password() -> str:
+    if not os.isatty(0):
+        raise RuntimeError(
+            "No encrypted Proxmox root password is configured and no interactive terminal is available. "
+            "Start once in an interactive terminal to save it, or set proxmox_root_password_encrypted in config.json."
+        )
+    password = getpass.getpass("Enter Proxmox root password: ")
+    if not password:
+        raise RuntimeError("Proxmox root password cannot be empty.")
+    return password
+
+
+def ensure_proxmox_password() -> str:
+    global _PROXMOX_PASSWORD_CACHE
+    if _PROXMOX_PASSWORD_CACHE is not None:
+        return _PROXMOX_PASSWORD_CACHE
+
+    cfg = load_config()
+    encrypted = cfg.get(PROXMOX_PASSWORD_KEY, "").strip()
+    if encrypted:
+        password = decrypt_secret(encrypted)
+    else:
+        password = prompt_for_proxmox_password()
+        cfg[PROXMOX_PASSWORD_KEY] = encrypt_secret(password)
+        save_config(cfg)
+        logger.info("Encrypted Proxmox root password stored in %s", CONFIG_PATH)
+    _PROXMOX_PASSWORD_CACHE = password
+    return password
+
+
 def active_session_count(state: dict[str, Any]) -> int:
     """Return the number of currently active sessions (creating/running)."""
     return sum(1 for session in state.values() if session.get("status") in {"creating", "running"})
 
 
-def ssh_cmd(remote: str, timeout: int = 60) -> str:
+def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
     cfg = load_config()
-    cmd = [
-        "ssh",
-        "-i",
-        cfg["ssh_key_path"],
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=10",
-        f"{cfg['ssh_user']}@{cfg['proxmox_host']}",
-        remote,
-    ]
-    result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"command failed: {remote}")
-    return result.stdout.strip()
+    password = ensure_proxmox_password()
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    known_hosts_value = cfg.get("ssh_known_hosts_path", "")
+    known_hosts_display = "system known_hosts"
+    if known_hosts_value:
+        known_hosts = Path(known_hosts_value)
+        known_hosts_display = str(known_hosts)
+        if known_hosts.exists():
+            client.load_host_keys(str(known_hosts))
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    try:
+        client.connect(
+            hostname=cfg["proxmox_host"],
+            username=cfg["ssh_user"],
+            password=password,
+            timeout=timeout,
+            banner_timeout=timeout,
+            auth_timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+    except paramiko.BadHostKeyException as exc:
+        client.close()
+        raise RuntimeError(
+            f"SSH host key verification failed for {cfg['proxmox_host']}. "
+            f"Add the host key to {known_hosts_display} or system known_hosts "
+            f"(for example: ssh-keyscan -H {cfg['proxmox_host']} >> {known_hosts_display})."
+        ) from exc
+    except paramiko.AuthenticationException as exc:
+        client.close()
+        raise RuntimeError(f"SSH authentication failed for {cfg['ssh_user']}@{cfg['proxmox_host']}.") from exc
+    except (paramiko.SSHException, OSError) as exc:
+        client.close()
+        raise RuntimeError(f"SSH connection to {cfg['proxmox_host']} failed: {exc}") from exc
+    return client
+
+
+def ssh_cmd(remote: str, timeout: int = 60) -> str:
+    client = open_ssh_client(timeout=timeout)
+    try:
+        _, stdout, stderr = client.exec_command(remote, timeout=timeout)
+        stdout.channel.settimeout(timeout)
+        stderr.channel.settimeout(timeout)
+        try:
+            exit_code = stdout.channel.recv_exit_status()
+            out = stdout.read().decode(errors="replace").strip()
+            err = stderr.read().decode(errors="replace").strip()
+        except socket.timeout as exc:
+            raise RuntimeError(f"Remote command timed out after {timeout} seconds.") from exc
+    finally:
+        client.close()
+    if exit_code:
+        raise RuntimeError(err or out or f"remote command failed with exit code {exit_code}")
+    return out
 
 
 def validate_session_id(session_id: str) -> None:
@@ -168,11 +283,10 @@ async def wait_for_container(vmid: int, timeout: int) -> str:
     raise TimeoutError("container did not boot with an IPv4 address")
 
 
-def resize_pty(fd: int, rows: int, cols: int) -> None:
+def clamp_terminal_size(rows: int, cols: int) -> tuple[int, int]:
     rows = max(10, min(int(rows), 200))
     cols = max(20, min(int(cols), 400))
-    packed = struct.pack("HHHH", rows, cols, 0, 0)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
+    return rows, cols
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -256,34 +370,29 @@ async def terminal(websocket: WebSocket, session_id: str):
         state[session_id] = session
         write_state(state)
 
-    cfg = load_config()
     vmid = int(session["vmid"])
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.execvp(
-            "ssh",
-            [
-                "ssh",
-                "-tt",
-                "-i",
-                cfg["ssh_key_path"],
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=no",
-                f"{cfg['ssh_user']}@{cfg['proxmox_host']}",
-                f"pct exec {vmid} -- bash -l",
-            ],
-        )
-
-    loop = asyncio.get_running_loop()
+    client = await asyncio.to_thread(open_ssh_client, 10)
+    transport = client.get_transport()
+    if transport is None:
+        logger.error("Failed to open SSH transport for session_id=%s vmid=%s", session_id, vmid)
+        client.close()
+        await websocket.close(code=1011)
+        return
+    channel = await asyncio.to_thread(transport.open_session, timeout=10)
+    await asyncio.to_thread(channel.get_pty, term="xterm", width=80, height=24)
+    await asyncio.to_thread(channel.exec_command, f"pct exec {vmid} -- bash -l")
 
     async def pty_to_ws():
         while True:
-            data = await loop.run_in_executor(None, os.read, fd, 4096)
-            if not data:
+            if await asyncio.to_thread(channel.recv_ready):
+                data = await asyncio.to_thread(channel.recv, 4096)
+                if not data:
+                    break
+                await websocket.send_bytes(data)
+                continue
+            if await asyncio.to_thread(channel.exit_status_ready):
                 break
-            await websocket.send_bytes(data)
+            await asyncio.sleep(0.05)
 
     async def ws_to_pty():
         while True:
@@ -294,28 +403,28 @@ async def terminal(websocket: WebSocket, session_id: str):
                     state[session_id]["last_seen"] = int(time.time())
                     write_state(state)
             if "bytes" in msg and msg["bytes"] is not None:
-                os.write(fd, msg["bytes"])
+                await asyncio.to_thread(channel.send, msg["bytes"])
             elif "text" in msg and msg["text"] is not None:
                 text = msg["text"]
                 try:
                     payload = json.loads(text)
                     if payload.get("type") == "input":
-                        os.write(fd, str(payload.get("data", "")).encode())
+                        await asyncio.to_thread(channel.send, str(payload.get("data", "")).encode())
                     elif payload.get("type") == "resize":
-                        resize_pty(fd, int(payload.get("rows", 24)), int(payload.get("cols", 80)))
+                        rows, cols = clamp_terminal_size(
+                            int(payload.get("rows", 24)), int(payload.get("cols", 80))
+                        )
+                        await asyncio.to_thread(channel.resize_pty, width=cols, height=rows)
                 except json.JSONDecodeError:
-                    os.write(fd, text.encode())
+                    await asyncio.to_thread(channel.send, text.encode())
 
     try:
         await asyncio.gather(pty_to_ws(), ws_to_pty())
     except WebSocketDisconnect:
         pass
     finally:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        os.close(fd)
+        channel.close()
+        client.close()
         await cleanup_session(session_id, "websocket_disconnect")
 
 
@@ -340,6 +449,7 @@ async def cleanup_loop():
 @app.on_event("startup")
 async def startup():
     init_state()
+    await asyncio.to_thread(ensure_proxmox_password)
     asyncio.create_task(cleanup_loop())
 
 
