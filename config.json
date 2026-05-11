@@ -5,7 +5,6 @@
   "ssh_user": "root",
   "ssh_known_hosts_path": "/opt/lxchoster/known_hosts",
   "proxmox_root_password_encrypted": "",
-  "ssh_key_path": "/opt/lxchoster/.ssh/id_ed25519",
   "storage": "local-lvm",
   "bridge": "vmbr0",
   "max_sessions": 25,

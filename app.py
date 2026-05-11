@@ -38,7 +38,6 @@ def load_config() -> dict[str, Any]:
     with CONFIG_PATH.open() as fh:
         cfg = json.load(fh)
     cfg.setdefault("ssh_user", "root")
-    cfg.setdefault("ssh_key_path", "/opt/lxchoster/.ssh/id_ed25519")
     cfg.setdefault("ssh_known_hosts_path", str(BASE_DIR / "known_hosts"))
     cfg.setdefault(PROXMOX_PASSWORD_KEY, "")
     cfg.setdefault("storage", "local-lvm")
@@ -169,19 +168,24 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
             look_for_keys=False,
             allow_agent=False,
         )
-    except paramiko.SSHException as exc:
+    except paramiko.BadHostKeyException as exc:
         client.close()
         raise RuntimeError(
             f"SSH host key verification failed for {cfg['proxmox_host']}. "
             f"Add the host key to {known_hosts} or system known_hosts."
         ) from exc
+    except paramiko.AuthenticationException as exc:
+        client.close()
+        raise RuntimeError(f"SSH authentication failed for {cfg['ssh_user']}@{cfg['proxmox_host']}.") from exc
+    except (paramiko.SSHException, OSError) as exc:
+        client.close()
+        raise RuntimeError(f"SSH connection to {cfg['proxmox_host']} failed: {exc}") from exc
     return client
 
 
 def ssh_cmd(remote: str, timeout: int = 60) -> str:
     with open_ssh_client(timeout=10) as client:
-        stdin, stdout, stderr = client.exec_command(remote, timeout=timeout)
-        del stdin
+        _, stdout, stderr = client.exec_command(remote, timeout=timeout)
         exit_code = stdout.channel.recv_exit_status()
         out = stdout.read().decode(errors="replace").strip()
         err = stderr.read().decode(errors="replace").strip()
@@ -420,7 +424,7 @@ async def cleanup_loop():
 @app.on_event("startup")
 async def startup():
     init_state()
-    ensure_proxmox_password()
+    await asyncio.to_thread(ensure_proxmox_password)
     asyncio.create_task(cleanup_loop())
 
 
