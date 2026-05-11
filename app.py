@@ -349,5 +349,7 @@ if __name__ == "__main__":
         port = int(port_raw)
     except ValueError as exc:
         raise SystemExit(f"Invalid PORT value: {port_raw}") from exc
+    if not (1 <= port <= 65535):
+        raise SystemExit(f"PORT out of range (1-65535): {port}")
     logger.info("Starting LXChoster in foreground on %s:%d", host, port)
     uvicorn.run("app:app", host=host, port=port)
