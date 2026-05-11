@@ -35,6 +35,8 @@ SECRET_KEY_PATH = STATE_DIR / "secret.key"
 PROXMOX_PASSWORD_KEY = "proxmox_root_password_encrypted"
 CLIENT_COOKIE_NAME = "lxchoster_client_id"
 SESSION_HISTORY_FIELDS = ["client_id", "session_id", "vmid", "hostname", "status", "updated_at"]
+COOKIE_MAX_AGE_SECONDS = 31536000
+MAX_CLIENT_ID_LENGTH = 120
 
 
 @asynccontextmanager
@@ -163,7 +165,7 @@ def upsert_session_history(client_id: str, session_id: str, session: dict[str, A
     rows = [
         row
         for row in read_session_history()
-        if row.get("client_id") != client_id or row.get("session_id") != session_id
+        if row.get("client_id") != client_id and row.get("session_id") != session_id
     ]
     rows.append(
         {
@@ -187,21 +189,21 @@ def attach_client_cookie(response: JSONResponse, request: Request, client_id: st
     response.set_cookie(
         key=CLIENT_COOKIE_NAME,
         value=client_id,
-        max_age=31536000,
+        max_age=COOKIE_MAX_AGE_SECONDS,
         httponly=True,
         samesite="lax",
         secure=request.url.scheme == "https",
     )
 
 
-def normalize_client_id(value: str | None) -> str:
+def normalize_client_id(value: str | None) -> str | None:
     if not value:
-        return secrets.token_urlsafe(18)
+        return None
     cleaned = value.strip()
-    if len(cleaned) > 120:
-        return secrets.token_urlsafe(18)
+    if len(cleaned) > MAX_CLIENT_ID_LENGTH:
+        return None
     if not re.fullmatch(r"[A-Za-z0-9._~-]+", cleaned):
-        return secrets.token_urlsafe(18)
+        return None
     return cleaned
 
 
@@ -220,7 +222,10 @@ async def apply_network_restrictions(vmid: int, cfg: dict[str, Any]) -> None:
 
     lines = ["set -eu"]
     if v4_allow or v4_block:
-        lines.append("command -v iptables >/dev/null 2>&1 || { echo 'iptables missing' >&2; exit 1; }")
+        lines.append(
+            "command -v iptables >/dev/null 2>&1 || { "
+            "echo 'iptables not found - network restrictions cannot be applied' >&2; exit 1; }"
+        )
         for cidr in v4_allow:
             q = shlex.quote(cidr)
             lines.append(
@@ -232,7 +237,10 @@ async def apply_network_restrictions(vmid: int, cfg: dict[str, Any]) -> None:
                 f"iptables -C OUTPUT -d {q} -j REJECT >/dev/null 2>&1 || iptables -A OUTPUT -d {q} -j REJECT"
             )
     if v6_allow or v6_block:
-        lines.append("command -v ip6tables >/dev/null 2>&1 || { echo 'ip6tables missing' >&2; exit 1; }")
+        lines.append(
+            "command -v ip6tables >/dev/null 2>&1 || { "
+            "echo 'ip6tables not found - network restrictions cannot be applied' >&2; exit 1; }"
+        )
         for cidr in v6_allow:
             q = shlex.quote(cidr)
             lines.append(
@@ -463,12 +471,13 @@ async def launch(request: Request):
     password = secrets.token_urlsafe(24)
     now = int(time.time())
     session_ttl = int(cfg["session_ttl_seconds"])
-    client_id = normalize_client_id(request.cookies.get(CLIENT_COOKIE_NAME))
+    presented_client_id = normalize_client_id(request.cookies.get(CLIENT_COOKIE_NAME))
+    issued_client_id = secrets.token_urlsafe(18)
     with StateLock():
         state = read_state()
         history_rows = read_session_history()
         history_by_client = {row["client_id"]: row for row in history_rows}
-        remembered = history_by_client.get(client_id)
+        remembered = history_by_client.get(presented_client_id) if presented_client_id else None
         if remembered:
             remembered_session_id = remembered.get("session_id", "")
             remembered_session = state.get(remembered_session_id)
@@ -477,10 +486,11 @@ async def launch(request: Request):
                 and remembered_session.get("status") == "running"
                 and int(remembered_session.get("last_seen", 0)) >= (now - session_ttl)
             ):
+                remembered_session["client_id"] = issued_client_id
                 remembered_session["last_seen"] = now
                 state[remembered_session_id] = remembered_session
                 write_state(state)
-                upsert_session_history(client_id, remembered_session_id, remembered_session, now)
+                upsert_session_history(issued_client_id, remembered_session_id, remembered_session, now)
                 response = JSONResponse(
                     {
                         "session_id": remembered_session_id,
@@ -490,10 +500,10 @@ async def launch(request: Request):
                         "reused": True,
                     }
                 )
-                attach_client_cookie(response, request, client_id)
+                attach_client_cookie(response, request, issued_client_id)
                 return response
             history_rows = [
-                row for row in history_rows if row.get("client_id") != client_id
+                row for row in history_rows if row.get("client_id") != presented_client_id
             ]
             write_session_history(history_rows)
 
@@ -510,13 +520,13 @@ async def launch(request: Request):
         state[session_id] = {
             "vmid": vmid,
             "hostname": hostname,
-            "client_id": client_id,
+            "client_id": issued_client_id,
             "status": "creating",
             "created_at": now,
             "last_seen": now,
         }
         write_state(state)
-        upsert_session_history(client_id, session_id, state[session_id], now)
+        upsert_session_history(issued_client_id, session_id, state[session_id], now)
 
     try:
         await run_ssh(
@@ -544,7 +554,7 @@ async def launch(request: Request):
         state = read_state()
         state[session_id].update({"status": "running", "ip": ip, "last_seen": int(time.time())})
         write_state(state)
-        upsert_session_history(client_id, session_id, state[session_id], int(time.time()))
+        upsert_session_history(issued_client_id, session_id, state[session_id], int(time.time()))
         logger.info(
             "Session created id=%s vmid=%s hostname=%s active_sessions=%d",
             session_id,
@@ -555,7 +565,7 @@ async def launch(request: Request):
     response = JSONResponse(
         {"session_id": session_id, "vmid": vmid, "hostname": hostname, "ip": ip, "reused": False}
     )
-    attach_client_cookie(response, request, client_id)
+    attach_client_cookie(response, request, issued_client_id)
     return response
 
 

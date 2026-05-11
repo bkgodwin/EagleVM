@@ -31,6 +31,7 @@ python3 app.py
 ```
 
 By default this listens on `0.0.0.0:5000`. Override with `HOST=<host>` and/or `PORT=<port>`.
+If the host is reachable from untrusted networks, place it behind a firewall/reverse proxy or set `HOST=127.0.0.1`.
 Session lifecycle events are logged to the terminal, including active session count on create/delete.
 
 Restart:
