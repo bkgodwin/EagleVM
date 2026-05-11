@@ -448,11 +448,13 @@ async def terminal(websocket: WebSocket, session_id: str):
     ws_task = asyncio.create_task(ws_to_pty())
     pty_task = asyncio.create_task(pty_to_ws())
     try:
-        done, pending = await asyncio.wait({pty_task, ws_task}, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
+        completed_tasks, pending_tasks = await asyncio.wait(
+            {pty_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending_tasks:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        for task in completed_tasks:
             exc = task.exception()
             if exc and not isinstance(exc, (WebSocketDisconnect, RuntimeError)):
                 raise exc
