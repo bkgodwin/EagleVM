@@ -10,10 +10,16 @@
 <body>
   <main id="launch" class="panel">
     <div class="brand">LXChoster</div>
+    <p class="lead">Spin up a temporary Proxmox LXC shell session directly in your browser.</p>
+    <ul class="how-it-works">
+      <li>Click <strong>Launch Session</strong> to clone a temporary container from a template.</li>
+      <li>Connect instantly to an interactive root terminal in the web page.</li>
+      <li>When the session ends, the temporary container is destroyed automatically.</li>
+    </ul>
     <form id="launch-form">
-      <button type="submit">Launch</button>
+      <button type="submit">Launch Session</button>
     </form>
-    <div id="status"></div>
+    <div id="status" role="status" aria-live="polite"></div>
   </main>
   <section id="terminal-wrap" hidden>
     <div id="terminal"></div>
