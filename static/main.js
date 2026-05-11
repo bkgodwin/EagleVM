@@ -8,29 +8,27 @@ const containerIp = document.getElementById("container-ip");
 const helpButton = document.getElementById("help-button");
 const helpModal = document.getElementById("help-modal");
 const helpClose = document.getElementById("help-close");
+const helpHeaderClose = document.getElementById("help-header-close");
+
+function closeHelp() {
+  helpModal.hidden = true;
+  helpButton.focus();
+}
 
 helpButton.addEventListener("click", () => {
   helpModal.hidden = false;
-  helpClose.focus();
+  helpHeaderClose.focus();
 });
 
-helpClose.addEventListener("click", () => {
-  helpModal.hidden = true;
-  helpButton.focus();
-});
+helpClose.addEventListener("click", closeHelp);
+helpHeaderClose.addEventListener("click", closeHelp);
 
 helpModal.addEventListener("click", (event) => {
-  if (event.target === helpModal) {
-    helpModal.hidden = true;
-    helpButton.focus();
-  }
+  if (event.target === helpModal) closeHelp();
 });
 
 window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !helpModal.hidden) {
-    helpModal.hidden = true;
-    helpButton.focus();
-  }
+  if (event.key === "Escape" && !helpModal.hidden) closeHelp();
 });
 
 form.addEventListener("submit", async (event) => {
