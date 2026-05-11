@@ -328,7 +328,6 @@ async def terminal(websocket: WebSocket, session_id: str):
         state[session_id] = session
         write_state(state)
 
-    cfg = load_config()
     vmid = int(session["vmid"])
     client = open_ssh_client(timeout=10)
     transport = client.get_transport()
