@@ -49,7 +49,13 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(cfg: dict[str, Any]) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+    payload = json.dumps(cfg, indent=2, sort_keys=True) + "\n"
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(payload)
+    tmp.replace(CONFIG_PATH)
+    os.chmod(CONFIG_PATH, 0o600)
 
 
 def init_state() -> None:
@@ -111,7 +117,10 @@ def decrypt_secret(value: str) -> str:
     try:
         return get_fernet().decrypt(value.encode()).decode()
     except InvalidToken as exc:
-        raise RuntimeError("Failed to decrypt stored Proxmox root password.") from exc
+        raise RuntimeError(
+            "Failed to decrypt stored Proxmox root password. "
+            "If needed, clear proxmox_root_password_encrypted in config.json and restart to re-enter it."
+        ) from exc
 
 
 def prompt_for_proxmox_password() -> str:
@@ -173,7 +182,8 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
         client.close()
         raise RuntimeError(
             f"SSH host key verification failed for {cfg['proxmox_host']}. "
-            f"Add the host key to {known_hosts} or system known_hosts."
+            f"Add the host key to {known_hosts} or system known_hosts "
+            f"(for example: ssh-keyscan -H {cfg['proxmox_host']} >> {known_hosts})."
         ) from exc
     except paramiko.AuthenticationException as exc:
         client.close()
