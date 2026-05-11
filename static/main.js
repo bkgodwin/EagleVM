@@ -107,7 +107,12 @@ async function openGUI(session) {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   const wsUrl = `${protocol}://${location.host}/ws-gui/${session.session_id}`;
 
-  const rfb = new RFB(vncCanvas, wsUrl);
+  const rfbOptions = {};
+  if (session.gui_vnc_password) {
+    rfbOptions.credentials = { password: session.gui_vnc_password };
+  }
+
+  const rfb = new RFB(vncCanvas, wsUrl, rfbOptions);
   rfb.scaleViewport = true;
   rfb.resizeSession = false;
   rfb.viewOnly = false;

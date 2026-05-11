@@ -38,6 +38,9 @@ CLIENT_COOKIE_NAME = "lxchoster_client_id"
 SESSION_HISTORY_FIELDS = ["client_id", "session_id", "vmid", "hostname", "status", "updated_at"]
 COOKIE_MAX_AGE_SECONDS = 31536000
 MAX_CLIENT_ID_LENGTH = 120
+# Validation pattern for the GUI OS username: must start with a letter, followed by
+# up to 31 alphanumeric characters or the symbols . _ @ - (max 32 chars total).
+GUI_VM_USERNAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.@-]{0,31}$")
 
 
 @asynccontextmanager
@@ -490,13 +493,18 @@ async def wait_for_container(vmid: int, timeout: int) -> str:
     raise TimeoutError("container did not boot with an IPv4 address")
 
 
-async def start_gui_services(vmid: int) -> None:
+async def start_gui_services(vmid: int, vnc_password: str) -> None:
     """Start Xvfb, a desktop environment, and x11vnc inside the container.
 
     The container template must have ``xvfb``, ``x11vnc``, and at least one of
     ``xfce4``, ``openbox``, or ``fluxbox`` installed.  All processes are started
     in the background with ``nohup`` so they outlive the ``pct exec`` shell.
+
+    A per-session VNC password is written to ``/tmp/.vncpw`` inside the container
+    and passed to x11vnc via ``-rfbauth`` for defense-in-depth.  The password
+    contains only hex characters (0-9, a-f) and is safe to embed unquoted.
     """
+    # vnc_password is secrets.token_hex(4): hex chars only, safe to embed without quoting.
     script = (
         "set -e; "
         "export DISPLAY=:99; "
@@ -510,7 +518,8 @@ async def start_gui_services(vmid: int) -> None:
         "  nohup fluxbox >/tmp/desktop.log 2>&1 & "
         "fi; "
         "sleep 1; "
-        "nohup x11vnc -display :99 -forever -rfbport 5900 -nopw >/tmp/x11vnc.log 2>&1 &"
+        f"x11vnc -storepasswd {vnc_password} /tmp/.vncpw; "
+        "nohup x11vnc -display :99 -rfbauth /tmp/.vncpw -forever -rfbport 5900 >/tmp/x11vnc.log 2>&1 &"
     )
     await run_ssh(f"pct exec {vmid} -- bash -c {shlex.quote(script)}", timeout=30)
 
@@ -556,6 +565,8 @@ async def launch(request: Request):
     gui_vm_username = str(cfg.get("gui_vm_username", "")).strip() if is_gui else ""
     gui_vm_password = ensure_gui_vm_password() if is_gui else ""
     password = secrets.token_urlsafe(24)
+    # Per-session VNC password (8 hex chars) used for defense-in-depth VNC auth.
+    vnc_password = secrets.token_hex(4) if is_gui else ""
     now = int(time.time())
     session_ttl = int(cfg["session_ttl_seconds"])
     presented_client_id = normalize_client_id(request.cookies.get(CLIENT_COOKIE_NAME))
@@ -590,6 +601,7 @@ async def launch(request: Request):
                 if is_gui:
                     payload["gui_vm_username"] = gui_vm_username
                     payload["gui_vm_password"] = gui_vm_password
+                    payload["gui_vnc_password"] = str(remembered_session.get("vnc_password", ""))
                 response = JSONResponse(payload)
                 attach_client_cookie(response, request, issued_client_id)
                 return response
@@ -616,6 +628,7 @@ async def launch(request: Request):
             "created_at": now,
             "last_seen": now,
             "is_gui": is_gui,
+            "vnc_password": vnc_password,
         }
         write_state(state)
         upsert_session_history(issued_client_id, session_id, state[session_id], now)
@@ -637,7 +650,7 @@ async def launch(request: Request):
             timeout=60,
         )
         if is_gui and gui_vm_username and gui_vm_password:
-            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.@-]{0,31}", gui_vm_username):
+            if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
                 gui_pw_b64 = base64.b64encode(gui_vm_password.encode()).decode()
                 await run_ssh(
                     f"pct exec {vmid} -- sh -lc "
@@ -653,7 +666,7 @@ async def launch(request: Request):
         await apply_network_restrictions(vmid, cfg)
         ip = await wait_for_container(vmid, int(cfg["boot_timeout_seconds"]))
         if is_gui:
-            await start_gui_services(vmid)
+            await start_gui_services(vmid, vnc_password)
             await wait_for_vnc(vmid, int(cfg["boot_timeout_seconds"]))
     except Exception as exc:
         await cleanup_session(session_id, f"create_failed: {exc}")
@@ -676,6 +689,7 @@ async def launch(request: Request):
     if is_gui:
         payload["gui_vm_username"] = gui_vm_username
         payload["gui_vm_password"] = gui_vm_password
+        payload["gui_vnc_password"] = vnc_password
     response = JSONResponse(payload)
     attach_client_cookie(response, request, issued_client_id)
     return response
@@ -862,7 +876,7 @@ async def gui_session(websocket: WebSocket, session_id: str):
                 continue
             if await asyncio.to_thread(lambda: channel.closed):
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)
 
     async def ws_to_vnc():
         while True:
