@@ -17,6 +17,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.websockets import WebSocketState
 import uvicorn
 
 
@@ -407,10 +408,18 @@ async def terminal(websocket: WebSocket, session_id: str):
                 data = await asyncio.to_thread(channel.recv, 4096)
                 if not data:
                     break
+                if (
+                    websocket.application_state != WebSocketState.CONNECTED
+                    or websocket.client_state != WebSocketState.CONNECTED
+                ):
+                    break
                 try:
                     await websocket.send_bytes(data)
-                except RuntimeError as exc:
-                    if "disconnect" in str(exc).lower() or "close" in str(exc).lower():
+                except RuntimeError:
+                    if (
+                        websocket.application_state != WebSocketState.CONNECTED
+                        or websocket.client_state != WebSocketState.CONNECTED
+                    ):
                         break
                     raise
                 continue
@@ -424,7 +433,7 @@ async def terminal(websocket: WebSocket, session_id: str):
                 msg = await websocket.receive()
             except WebSocketDisconnect:
                 break
-            if msg["type"] == "websocket.disconnect":
+            if msg.get("type") != "websocket.receive":
                 break
             with StateLock():
                 state = read_state()
