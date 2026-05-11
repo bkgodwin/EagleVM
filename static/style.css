@@ -333,3 +333,196 @@ button:disabled {
     margin-top: 4px;
   }
 }
+
+/* ── GUI / VNC viewer ───────────────────────────────────────────────────── */
+#gui-wrap {
+  width: min(1400px, 100%);
+  height: min(85vh, 900px);
+  min-height: 400px;
+  max-height: calc(100vh - 32px);
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #183b22;
+  border-radius: 10px;
+  box-shadow: 0 20px 80px rgba(0, 0, 0, .45);
+}
+
+#vnc-canvas {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  background: #111;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* noVNC appends a <canvas> directly; stretch it to fill the container */
+#vnc-canvas canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: contain;
+}
+
+#gui-session-banner {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 14px;
+  border-top: 1px solid #183b22;
+  background: #07110b;
+  color: #c6f7d4;
+  font-size: 13px;
+  white-space: nowrap;
+  flex-wrap: wrap;
+}
+
+#gui-session-banner .warning {
+  margin-left: auto;
+  color: #ffdf7e;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.creds-badge {
+  background: #0e2518;
+  border: 1px solid #1b4d2a;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: #9ee8b6;
+  letter-spacing: 0.02em;
+  user-select: text;
+}
+
+/* ── Credentials modal ──────────────────────────────────────────────────── */
+#credentials-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.82);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  z-index: 2000;
+  backdrop-filter: blur(3px);
+}
+
+#credentials-window {
+  width: min(480px, 100%);
+  background: #07110b;
+  border: 1px solid #1b4d2a;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 32px 96px rgba(0, 0, 0, 0.75);
+}
+
+#creds-header {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid #1b4d2a;
+  background: #091610;
+}
+
+#creds-header h2 {
+  margin: 0;
+  color: #64ff95;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+#creds-body {
+  padding: 18px 20px;
+  display: grid;
+  gap: 14px;
+}
+
+.creds-intro {
+  margin: 0;
+  color: #b0e8c4;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.creds-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.creds-table tr + tr td {
+  border-top: 1px solid #122318;
+}
+
+.creds-table td {
+  padding: 8px 10px;
+  vertical-align: middle;
+}
+
+.creds-table td:first-child {
+  color: #6bbf8a;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  width: 1%;
+  padding-right: 20px;
+}
+
+.creds-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  color: #64ff95;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  user-select: text;
+}
+
+.creds-note {
+  margin: 0;
+  color: #6bbf8a;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+#creds-connect-btn {
+  border-top: 1px solid #1b4d2a;
+  border-radius: 0 0 12px 12px;
+  min-height: 44px;
+  background: #36d46b;
+  color: #041108;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  transition: background 0.15s;
+}
+
+#creds-connect-btn:hover {
+  background: #48e87c;
+}
+
+@media (max-width: 700px) {
+  #gui-wrap {
+    border-radius: 6px;
+  }
+
+  #gui-session-banner {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 10px;
+  }
+
+  #gui-session-banner .warning {
+    margin-left: 0;
+  }
+}
