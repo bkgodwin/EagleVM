@@ -78,6 +78,7 @@ def write_state(state: dict[str, Any]) -> None:
 
 
 def active_session_count(state: dict[str, Any]) -> int:
+    """Return the number of currently active sessions (creating/running)."""
     return sum(1 for session in state.values() if session.get("status") in {"creating", "running"})
 
 
