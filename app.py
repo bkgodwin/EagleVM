@@ -2,6 +2,7 @@ import asyncio
 import base64
 import fcntl
 import json
+import logging
 import os
 import pty
 import secrets
@@ -16,6 +17,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+import uvicorn
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,6 +28,8 @@ LOCK_PATH = STATE_DIR / "sessions.lock"
 
 app = FastAPI(title="LXChoster")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("lxchoster")
 
 
 def load_config() -> dict[str, Any]:
@@ -71,6 +75,11 @@ def write_state(state: dict[str, Any]) -> None:
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
     tmp.replace(STATE_PATH)
+
+
+def active_session_count(state: dict[str, Any]) -> int:
+    """Return the number of currently active sessions (creating/running)."""
+    return sum(1 for session in state.values() if session.get("status") in {"creating", "running"})
 
 
 def ssh_cmd(remote: str, timeout: int = 60) -> str:
@@ -137,6 +146,13 @@ async def cleanup_session(session_id: str, reason: str = "cleanup") -> None:
             "cleanup_reason": reason,
         }
         write_state(state)
+        logger.info(
+            "Session deleted id=%s vmid=%s reason=%s active_sessions=%d",
+            session_id,
+            vmid,
+            reason,
+            active_session_count(state),
+        )
 
 
 async def wait_for_container(vmid: int, timeout: int) -> str:
@@ -215,6 +231,13 @@ async def launch():
         state = read_state()
         state[session_id].update({"status": "running", "ip": ip, "last_seen": int(time.time())})
         write_state(state)
+        logger.info(
+            "Session created id=%s vmid=%s hostname=%s active_sessions=%d",
+            session_id,
+            vmid,
+            hostname,
+            active_session_count(state),
+        )
     return {"session_id": session_id, "vmid": vmid, "hostname": hostname, "ip": ip}
 
 
@@ -318,3 +341,16 @@ async def cleanup_loop():
 async def startup():
     init_state()
     asyncio.create_task(cleanup_loop())
+
+
+if __name__ == "__main__":
+    host = os.environ.get("HOST", "127.0.0.1")
+    port_raw = os.environ.get("PORT", "8000")
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid PORT value: {port_raw}") from exc
+    if not (1 <= port <= 65535):
+        raise SystemExit(f"PORT out of range (1-65535): {port}")
+    logger.info("Starting LXChoster in foreground on %s:%d", host, port)
+    uvicorn.run(app, host=host, port=port)

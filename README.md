@@ -16,6 +16,17 @@ Edit `/opt/lxchoster/config.json`.
 - App path: `/opt/lxchoster`
 - State path: `/var/lib/lxchoster/sessions.json`
 - Service: `lxchoster.service`
+- Foreground CLI run: `python3 app.py`
+
+### Run in foreground (no service)
+
+```sh
+cd /opt/lxchoster
+python3 app.py
+```
+
+By default this listens on `127.0.0.1:8000`. Override with `HOST=<host>` and/or `PORT=<port>`.
+Session lifecycle events are logged to the terminal, including active session count on create/delete.
 
 Restart:
 
