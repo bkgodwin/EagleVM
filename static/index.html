@@ -32,52 +32,171 @@
   </section>
   <section id="help-modal" hidden>
     <div id="help-window" role="dialog" aria-modal="true" aria-labelledby="help-title">
-      <h2 id="help-title">Linux command and service help</h2>
-      <div id="help-content">
-        <ul>
-          <li><strong>pwd</strong> — print your current working directory path.</li>
-          <li><strong>ls -lah</strong> — list files with permissions, size, and hidden items.</li>
-          <li><strong>cd &lt;dir&gt;</strong> — change into another directory.</li>
-          <li><strong>mkdir -p &lt;dir&gt;</strong> — create directories, including parents when needed.</li>
-          <li><strong>cp -r src dst</strong> — copy files/directories recursively.</li>
-          <li><strong>mv src dst</strong> — move or rename files/directories.</li>
-          <li><strong>rm -rf &lt;path&gt;</strong> — remove files/directories recursively (dangerous).</li>
-          <li><strong>cat file</strong> — print file contents quickly.</li>
-          <li><strong>less file</strong> — open a scrollable file viewer.</li>
-          <li><strong>head -n 20 file</strong> — show the first lines of a file.</li>
-          <li><strong>tail -f file</strong> — follow new lines appended to a file/log.</li>
-          <li><strong>grep -R "text" .</strong> — search recursively for matching text.</li>
-          <li><strong>find . -name "*.log"</strong> — find files matching a name pattern.</li>
-          <li><strong>du -sh *</strong> — estimate disk usage for files/directories.</li>
-          <li><strong>df -h</strong> — show mounted filesystem usage.</li>
-          <li><strong>free -h</strong> — display RAM and swap usage.</li>
-          <li><strong>ps aux</strong> — list active processes.</li>
-          <li><strong>top</strong> — interactive process and resource monitor.</li>
-          <li><strong>kill &lt;pid&gt;</strong> — terminate a process by PID.</li>
-          <li><strong>chmod 755 file</strong> — change file permissions.</li>
-          <li><strong>chown user:group file</strong> — change file owner and group.</li>
-          <li><strong>tar -czf archive.tgz dir</strong> — create a compressed tar archive.</li>
-          <li><strong>curl -I https://example.com</strong> — inspect HTTP response headers.</li>
-          <li><strong>wget URL</strong> — download a file from the web.</li>
-          <li><strong>ssh user@host</strong> — connect to another machine via SSH.</li>
-          <li><strong>ip addr</strong> — show network interface addresses.</li>
-          <li><strong>ss -tulpn</strong> — list listening sockets and owners.</li>
-          <li><strong>ping host</strong> — test network reachability to a host.</li>
-          <li><strong>journalctl -xe</strong> — inspect recent systemd logs.</li>
-          <li><strong>systemctl status service</strong> — inspect a systemd service status.</li>
-          <li><strong>systemctl start|stop|restart service</strong> — manage systemd services.</li>
-          <li><strong>service name status</strong> — SysV compatibility wrapper on some distros.</li>
-          <li><strong>crontab -e</strong> — edit scheduled user cron jobs.</li>
-          <li><strong>nano file</strong> — simple terminal text editor.</li>
-          <li><strong>vim file</strong> — advanced modal text editor.</li>
-          <li><strong>python3</strong> — start the Python interpreter.</li>
-          <li><strong>apt update &amp;&amp; apt install pkg</strong> — refresh repositories and install package.</li>
-          <li><strong>dpkg -l</strong> — list installed Debian packages.</li>
-          <li><strong>uname -a</strong> — show kernel and OS build details.</li>
-          <li><strong>history</strong> — show command history in current shell.</li>
-        </ul>
+      <div id="help-header">
+        <h2 id="help-title">Linux Quick Reference <span class="help-subtitle">— LXChoster Terminal</span></h2>
+        <button id="help-header-close" type="button" aria-label="Close help">&#x2715;</button>
       </div>
-      <button id="help-close" type="button">Exit</button>
+      <div id="help-content">
+
+        <div class="help-section">
+          <div class="help-section-title">Keyboard Shortcuts</div>
+          <div class="help-shortcuts">
+            <span class="help-shortcut"><kbd>Ctrl</kbd>+<kbd>C</kbd> interrupt / cancel running command</span>
+            <span class="help-shortcut"><kbd>Ctrl</kbd>+<kbd>Z</kbd> suspend process to background</span>
+            <span class="help-shortcut"><kbd>Ctrl</kbd>+<kbd>L</kbd> clear the terminal screen</span>
+            <span class="help-shortcut"><kbd>Ctrl</kbd>+<kbd>A</kbd> jump to beginning of line</span>
+            <span class="help-shortcut"><kbd>Ctrl</kbd>+<kbd>E</kbd> jump to end of line</span>
+            <span class="help-shortcut"><kbd>Ctrl</kbd>+<kbd>R</kbd> reverse search command history</span>
+            <span class="help-shortcut"><kbd>Tab</kbd> autocomplete paths and commands</span>
+            <span class="help-shortcut"><kbd>↑</kbd> / <kbd>↓</kbd> browse command history</span>
+            <span class="help-shortcut"><kbd>Esc</kbd> close this help panel</span>
+          </div>
+        </div>
+
+        <div class="help-section">
+          <div class="help-section-title">File System Navigation</div>
+          <table>
+            <tr><td>pwd</td><td>Print current working directory path.</td></tr>
+            <tr><td>ls -lah</td><td>List files with permissions, human-readable sizes, and hidden items.</td></tr>
+            <tr><td>cd &lt;dir&gt;</td><td>Change into a directory. <code>cd -</code> returns to the previous directory.</td></tr>
+            <tr><td>mkdir -p &lt;dir&gt;</td><td>Create a directory tree, including any missing parents.</td></tr>
+            <tr><td>cp -r src dst</td><td>Copy files or directories recursively.</td></tr>
+            <tr><td>mv src dst</td><td>Move or rename files and directories.</td></tr>
+            <tr><td>rm -rf &lt;path&gt;</td><td>Remove files or directories recursively. <strong>Irreversible — use with care.</strong></td></tr>
+            <tr><td>ln -s target link</td><td>Create a symbolic link pointing to <em>target</em>.</td></tr>
+            <tr><td>find . -name "*.log"</td><td>Find files matching a name pattern beneath the current directory.</td></tr>
+            <tr><td>du -sh *</td><td>Estimate disk usage for each file and directory.</td></tr>
+            <tr><td>df -h</td><td>Show mounted filesystem sizes and available space.</td></tr>
+          </table>
+        </div>
+
+        <div class="help-section">
+          <div class="help-section-title">Viewing &amp; Editing Files</div>
+          <table>
+            <tr><td>cat file</td><td>Print the full contents of a file to the terminal.</td></tr>
+            <tr><td>less file</td><td>Open a scrollable pager (press <kbd>q</kbd> to quit).</td></tr>
+            <tr><td>head -n 20 file</td><td>Print the first 20 lines of a file.</td></tr>
+            <tr><td>tail -n 50 file</td><td>Print the last 50 lines of a file.</td></tr>
+            <tr><td>tail -f file</td><td>Stream new lines appended to a file in real time.</td></tr>
+            <tr><td>grep -R "text" .</td><td>Search recursively for matching text across all files.</td></tr>
+            <tr><td>nano file</td><td>Simple terminal text editor. Save with <kbd>Ctrl</kbd>+<kbd>O</kbd>, quit with <kbd>Ctrl</kbd>+<kbd>X</kbd>.</td></tr>
+            <tr><td>vim file</td><td>Advanced modal editor. Press <kbd>i</kbd> to insert, <kbd>Esc</kbd> then <code>:wq</code> to save and quit.</td></tr>
+            <tr><td>diff file1 file2</td><td>Show line-by-line differences between two files.</td></tr>
+            <tr><td>wc -l file</td><td>Count the number of lines in a file.</td></tr>
+          </table>
+        </div>
+
+        <div class="help-section">
+          <div class="help-section-title">Process &amp; Resource Management</div>
+          <table>
+            <tr><td>ps aux</td><td>List all running processes with CPU and memory usage.</td></tr>
+            <tr><td>top</td><td>Interactive real-time process and resource monitor. Press <kbd>q</kbd> to quit.</td></tr>
+            <tr><td>htop</td><td>Enhanced interactive process viewer (may require install).</td></tr>
+            <tr><td>kill &lt;pid&gt;</td><td>Send SIGTERM to a process, requesting graceful termination.</td></tr>
+            <tr><td>kill -9 &lt;pid&gt;</td><td>Force-kill a process immediately with SIGKILL.</td></tr>
+            <tr><td>pkill &lt;name&gt;</td><td>Kill all processes matching a name pattern.</td></tr>
+            <tr><td>bg / fg</td><td>Resume a suspended job in the background or foreground.</td></tr>
+            <tr><td>jobs</td><td>List jobs running in the current shell session.</td></tr>
+            <tr><td>free -h</td><td>Display total, used, and available RAM and swap.</td></tr>
+            <tr><td>uptime</td><td>Show how long the system has been running and load averages.</td></tr>
+            <tr><td>lscpu</td><td>Display CPU architecture details and core count.</td></tr>
+          </table>
+        </div>
+
+        <div class="help-section">
+          <div class="help-section-title">Networking</div>
+          <table>
+            <tr><td>ip addr</td><td>Show all network interfaces and their IP addresses.</td></tr>
+            <tr><td>ip route</td><td>Display the kernel routing table.</td></tr>
+            <tr><td>ss -tulpn</td><td>List listening TCP/UDP sockets with process owners.</td></tr>
+            <tr><td>ping -c 4 host</td><td>Send 4 ICMP packets to test reachability of a host.</td></tr>
+            <tr><td>traceroute host</td><td>Trace the network path to a host.</td></tr>
+            <tr><td>curl -I URL</td><td>Fetch only HTTP response headers from a URL.</td></tr>
+            <tr><td>curl -O URL</td><td>Download a file from a URL, keeping its remote filename.</td></tr>
+            <tr><td>wget URL</td><td>Download a file from the web to the current directory.</td></tr>
+            <tr><td>ssh user@host</td><td>Open an encrypted remote shell to another machine.</td></tr>
+            <tr><td>scp src user@host:dst</td><td>Securely copy a file to or from a remote host.</td></tr>
+            <tr><td>nslookup host</td><td>Query DNS to resolve a hostname to an IP address.</td></tr>
+          </table>
+        </div>
+
+        <div class="help-section">
+          <div class="help-section-title">Archiving &amp; Compression</div>
+          <table>
+            <tr><td>tar -czf out.tgz dir</td><td>Create a gzip-compressed tar archive from a directory.</td></tr>
+            <tr><td>tar -xzf archive.tgz</td><td>Extract a gzip-compressed tar archive.</td></tr>
+            <tr><td>tar -tf archive.tgz</td><td>List the contents of a tar archive without extracting.</td></tr>
+            <tr><td>zip -r out.zip dir</td><td>Create a zip archive of a directory.</td></tr>
+            <tr><td>unzip archive.zip</td><td>Extract a zip archive to the current directory.</td></tr>
+            <tr><td>gzip / gunzip file</td><td>Compress or decompress a single file in place.</td></tr>
+          </table>
+        </div>
+
+        <div class="help-section">
+          <div class="help-section-title">Permissions &amp; Ownership</div>
+          <table>
+            <tr><td>chmod 755 file</td><td>Set file permissions (owner rwx, group r-x, others r-x).</td></tr>
+            <tr><td>chmod +x file</td><td>Make a file executable for all users.</td></tr>
+            <tr><td>chown user:group file</td><td>Change the owner and group of a file or directory.</td></tr>
+            <tr><td>chown -R user dir</td><td>Recursively change ownership of a directory tree.</td></tr>
+            <tr><td>umask</td><td>Show the default permission mask for new files.</td></tr>
+            <tr><td>id</td><td>Print the current user's UID, GID, and group memberships.</td></tr>
+            <tr><td>whoami</td><td>Print the effective username.</td></tr>
+          </table>
+        </div>
+
+        <div class="help-section">
+          <div class="help-section-title">Package Management (Debian / Ubuntu)</div>
+          <table>
+            <tr><td>apt update</td><td>Refresh the local package index from all configured sources.</td></tr>
+            <tr><td>apt upgrade</td><td>Upgrade all installed packages to their latest versions.</td></tr>
+            <tr><td>apt install pkg</td><td>Download and install a package and its dependencies.</td></tr>
+            <tr><td>apt remove pkg</td><td>Uninstall a package, keeping its configuration files.</td></tr>
+            <tr><td>apt purge pkg</td><td>Uninstall a package and remove its configuration files.</td></tr>
+            <tr><td>apt search term</td><td>Search available packages for a keyword.</td></tr>
+            <tr><td>apt show pkg</td><td>Display detailed information about a package.</td></tr>
+            <tr><td>dpkg -l</td><td>List all installed Debian packages.</td></tr>
+            <tr><td>dpkg -i file.deb</td><td>Install a local <code>.deb</code> package file.</td></tr>
+          </table>
+        </div>
+
+        <div class="help-section">
+          <div class="help-section-title">Systemd &amp; Services</div>
+          <table>
+            <tr><td>systemctl status svc</td><td>Show the current status and recent log output of a service.</td></tr>
+            <tr><td>systemctl start svc</td><td>Start a service immediately.</td></tr>
+            <tr><td>systemctl stop svc</td><td>Stop a running service.</td></tr>
+            <tr><td>systemctl restart svc</td><td>Stop then start a service (applies configuration changes).</td></tr>
+            <tr><td>systemctl reload svc</td><td>Reload service configuration without a full restart (if supported).</td></tr>
+            <tr><td>systemctl enable svc</td><td>Enable a service to start automatically at boot.</td></tr>
+            <tr><td>systemctl disable svc</td><td>Prevent a service from starting at boot.</td></tr>
+            <tr><td>systemctl list-units</td><td>List all active systemd units.</td></tr>
+            <tr><td>journalctl -u svc</td><td>Show the log output for a specific service.</td></tr>
+            <tr><td>journalctl -xe</td><td>Show recent journal entries with explanations for errors.</td></tr>
+            <tr><td>journalctl -f</td><td>Stream new journal log entries in real time.</td></tr>
+          </table>
+        </div>
+
+        <div class="help-section">
+          <div class="help-section-title">Development &amp; Scripting</div>
+          <table>
+            <tr><td>python3 script.py</td><td>Run a Python 3 script.</td></tr>
+            <tr><td>python3 -m venv env</td><td>Create a virtual Python environment in the <code>env</code> directory.</td></tr>
+            <tr><td>source env/bin/activate</td><td>Activate a Python virtual environment.</td></tr>
+            <tr><td>pip install pkg</td><td>Install a Python package into the active environment.</td></tr>
+            <tr><td>node script.js</td><td>Run a JavaScript file with Node.js.</td></tr>
+            <tr><td>npm install</td><td>Install Node.js project dependencies from <code>package.json</code>.</td></tr>
+            <tr><td>bash script.sh</td><td>Execute a shell script with Bash.</td></tr>
+            <tr><td>chmod +x script.sh &amp;&amp; ./script.sh</td><td>Make a script executable and run it directly.</td></tr>
+            <tr><td>env</td><td>List all environment variables currently set.</td></tr>
+            <tr><td>export VAR=value</td><td>Set an environment variable for the current session and child processes.</td></tr>
+            <tr><td>history</td><td>Show previously entered commands with line numbers.</td></tr>
+            <tr><td>uname -a</td><td>Print kernel version, architecture, and OS build information.</td></tr>
+          </table>
+        </div>
+
+      </div>
+      <button id="help-close" type="button">Close Help</button>
     </div>
   </section>
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
