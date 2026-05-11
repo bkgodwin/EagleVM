@@ -26,7 +26,58 @@
     <div id="session-banner">
       <span id="container-name">Container: -</span>
       <span id="container-ip">IPv4: -</span>
-      <span class="warning">Closing this tab destroys the container.</span>
+      <button id="help-button" type="button">Help</button>
+      <span class="warning">Session remains available for a limited reconnect window after disconnect.</span>
+    </div>
+  </section>
+  <section id="help-modal" hidden>
+    <div id="help-window" role="dialog" aria-modal="true" aria-labelledby="help-title">
+      <h2 id="help-title">Linux command and service help</h2>
+      <div id="help-content">
+        <ul>
+          <li><strong>pwd</strong> — print your current working directory path.</li>
+          <li><strong>ls -lah</strong> — list files with permissions, size, and hidden items.</li>
+          <li><strong>cd &lt;dir&gt;</strong> — change into another directory.</li>
+          <li><strong>mkdir -p &lt;dir&gt;</strong> — create directories, including parents when needed.</li>
+          <li><strong>cp -r src dst</strong> — copy files/directories recursively.</li>
+          <li><strong>mv src dst</strong> — move or rename files/directories.</li>
+          <li><strong>rm -rf &lt;path&gt;</strong> — remove files/directories recursively (dangerous).</li>
+          <li><strong>cat file</strong> — print file contents quickly.</li>
+          <li><strong>less file</strong> — open a scrollable file viewer.</li>
+          <li><strong>head -n 20 file</strong> — show the first lines of a file.</li>
+          <li><strong>tail -f file</strong> — follow new lines appended to a file/log.</li>
+          <li><strong>grep -R "text" .</strong> — search recursively for matching text.</li>
+          <li><strong>find . -name "*.log"</strong> — find files matching a name pattern.</li>
+          <li><strong>du -sh *</strong> — estimate disk usage for files/directories.</li>
+          <li><strong>df -h</strong> — show mounted filesystem usage.</li>
+          <li><strong>free -h</strong> — display RAM and swap usage.</li>
+          <li><strong>ps aux</strong> — list active processes.</li>
+          <li><strong>top</strong> — interactive process and resource monitor.</li>
+          <li><strong>kill &lt;pid&gt;</strong> — terminate a process by PID.</li>
+          <li><strong>chmod 755 file</strong> — change file permissions.</li>
+          <li><strong>chown user:group file</strong> — change file owner and group.</li>
+          <li><strong>tar -czf archive.tgz dir</strong> — create a compressed tar archive.</li>
+          <li><strong>curl -I https://example.com</strong> — inspect HTTP response headers.</li>
+          <li><strong>wget URL</strong> — download a file from the web.</li>
+          <li><strong>ssh user@host</strong> — connect to another machine via SSH.</li>
+          <li><strong>ip addr</strong> — show network interface addresses.</li>
+          <li><strong>ss -tulpn</strong> — list listening sockets and owners.</li>
+          <li><strong>ping host</strong> — test network reachability to a host.</li>
+          <li><strong>journalctl -xe</strong> — inspect recent systemd logs.</li>
+          <li><strong>systemctl status service</strong> — inspect a systemd service status.</li>
+          <li><strong>systemctl start|stop|restart service</strong> — manage systemd services.</li>
+          <li><strong>service name status</strong> — SysV compatibility wrapper on some distros.</li>
+          <li><strong>crontab -e</strong> — edit scheduled user cron jobs.</li>
+          <li><strong>nano file</strong> — simple terminal text editor.</li>
+          <li><strong>vim file</strong> — advanced modal text editor.</li>
+          <li><strong>python3</strong> — start the Python interpreter.</li>
+          <li><strong>apt update &amp;&amp; apt install pkg</strong> — refresh repositories and install package.</li>
+          <li><strong>dpkg -l</strong> — list installed Debian packages.</li>
+          <li><strong>uname -a</strong> — show kernel and OS build details.</li>
+          <li><strong>history</strong> — show command history in current shell.</li>
+        </ul>
+      </div>
+      <button id="help-close" type="button">Exit</button>
     </div>
   </section>
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>

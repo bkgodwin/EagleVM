@@ -8,6 +8,16 @@
   "storage": "local-lvm",
   "bridge": "vmbr0",
   "max_sessions": 25,
-  "session_ttl_seconds": 3600,
-  "boot_timeout_seconds": 90
+  "session_ttl_seconds": 600,
+  "boot_timeout_seconds": 90,
+  "local_network_blocklist": [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+    "fc00::/7",
+    "fe80::/10"
+  ],
+  "local_network_allowlist": []
 }

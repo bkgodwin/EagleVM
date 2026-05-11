@@ -5,6 +5,33 @@ const wrap = document.getElementById("terminal-wrap");
 const terminalEl = document.getElementById("terminal");
 const containerName = document.getElementById("container-name");
 const containerIp = document.getElementById("container-ip");
+const helpButton = document.getElementById("help-button");
+const helpModal = document.getElementById("help-modal");
+const helpClose = document.getElementById("help-close");
+
+helpButton.addEventListener("click", () => {
+  helpModal.hidden = false;
+  helpClose.focus();
+});
+
+helpClose.addEventListener("click", () => {
+  helpModal.hidden = true;
+  helpButton.focus();
+});
+
+helpModal.addEventListener("click", (event) => {
+  if (event.target === helpModal) {
+    helpModal.hidden = true;
+    helpButton.focus();
+  }
+});
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !helpModal.hidden) {
+    helpModal.hidden = true;
+    helpButton.focus();
+  }
+});
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -94,7 +121,7 @@ function openTerminal(session) {
   });
   socket.addEventListener("close", () => {
     cleanup();
-    terminal.writeln("\\r\\nSession closed. Temporary container cleanup requested.");
+    terminal.writeln("\\r\\nSession disconnected. Reopen or relaunch within the reconnect window to resume.");
   });
 
   terminal.onData((data) => {
