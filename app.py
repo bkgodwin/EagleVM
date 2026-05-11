@@ -409,8 +409,10 @@ async def terminal(websocket: WebSocket, session_id: str):
                     break
                 try:
                     await websocket.send_bytes(data)
-                except RuntimeError:
-                    break
+                except RuntimeError as exc:
+                    if "disconnect" in str(exc).lower() or "close" in str(exc).lower():
+                        break
+                    raise
                 continue
             if await asyncio.to_thread(channel.exit_status_ready):
                 break
