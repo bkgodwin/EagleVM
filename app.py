@@ -202,7 +202,7 @@ def normalize_client_id(value: str | None) -> str | None:
     cleaned = value.strip()
     if len(cleaned) > MAX_CLIENT_ID_LENGTH:
         return None
-    if not re.fullmatch(r"[A-Za-z0-9._~-]+", cleaned):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", cleaned):
         return None
     return cleaned
 
@@ -484,6 +484,7 @@ async def launch(request: Request):
             if (
                 remembered_session
                 and remembered_session.get("status") == "running"
+                and remembered_session.get("client_id") == presented_client_id
                 and int(remembered_session.get("last_seen", 0)) >= (now - session_ttl)
             ):
                 remembered_session["client_id"] = issued_client_id
@@ -671,6 +672,7 @@ async def terminal(websocket: WebSocket, session_id: str):
     finally:
         channel.close()
         client.close()
+        # Keep sessions reconnectable until inactivity timeout instead of destroying on disconnect.
         with StateLock():
             state = read_state()
             if session_id in state and state[session_id].get("status") in {"creating", "running"}:
