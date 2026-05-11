@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LXChoster</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main id="launch" class="panel">
+    <div class="brand">LXChoster</div>
+    <form id="launch-form">
+      <button type="submit">Launch</button>
+    </form>
+    <div id="status"></div>
+  </main>
+  <section id="terminal-wrap" hidden>
+    <div id="terminal"></div>
+    <div id="session-banner">
+      <span id="container-name">Container: -</span>
+      <span id="container-ip">IPv4: -</span>
+      <span class="warning">Closing this tab destroys the container.</span>
+    </div>
+  </section>
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script src="/static/main.js"></script>
+</body>
+</html>

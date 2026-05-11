@@ -1,0 +1,20 @@
+[Unit]
+Description=LXChoster web application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lxchoster
+Group=lxchoster
+WorkingDirectory=/opt/lxchoster
+Environment=LXCHOSTER_CONFIG=/opt/lxchoster/config.json
+Environment=LXCHOSTER_STATE_DIR=/var/lib/lxchoster
+ExecStart=/opt/lxchoster/venv/bin/uvicorn app:app --host 0.0.0.0 --port 80
+Restart=always
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
