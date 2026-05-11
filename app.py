@@ -352,4 +352,4 @@ if __name__ == "__main__":
     if not (1 <= port <= 65535):
         raise SystemExit(f"PORT out of range (1-65535): {port}")
     logger.info("Starting LXChoster in foreground on %s:%d", host, port)
-    uvicorn.run("app:app", host=host, port=port)
+    uvicorn.run(app, host=host, port=port)
