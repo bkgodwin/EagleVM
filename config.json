@@ -1,0 +1,12 @@
+{
+  "template_id": 9000,
+  "proxmox_host": "192.168.0.10",
+  "node": "pve",
+  "ssh_user": "root",
+  "ssh_key_path": "/opt/lxchoster/.ssh/id_ed25519",
+  "storage": "local-lvm",
+  "bridge": "vmbr0",
+  "max_sessions": 25,
+  "session_ttl_seconds": 3600,
+  "boot_timeout_seconds": 90
+}
