@@ -344,6 +344,10 @@ async def startup():
 
 if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "8000"))
+    port_raw = os.environ.get("PORT", "8000")
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid PORT value: {port_raw}") from exc
     logger.info("Starting LXChoster in foreground on %s:%d", host, port)
     uvicorn.run("app:app", host=host, port=port)
