@@ -90,12 +90,13 @@ def get_fernet() -> Fernet:
         return _FERNET_CACHE
     init_state()
     if SECRET_KEY_PATH.exists():
-        key = SECRET_KEY_PATH.read_bytes().strip()
+        key = SECRET_KEY_PATH.read_bytes()
     else:
         key = Fernet.generate_key()
         tmp = SECRET_KEY_PATH.with_suffix(".tmp")
-        tmp.write_bytes(key)
-        os.chmod(tmp, 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(key)
         tmp.replace(SECRET_KEY_PATH)
     os.chmod(SECRET_KEY_PATH, 0o600)
     _FERNET_CACHE = Fernet(key)
@@ -119,8 +120,8 @@ def prompt_for_proxmox_password() -> str:
             "No encrypted Proxmox root password is configured and no interactive terminal is available. "
             "Start once in an interactive terminal to save it, or set proxmox_root_password_encrypted in config.json."
         )
-    password = getpass.getpass("Enter Proxmox root password: ").strip()
-    if not password:
+    password = getpass.getpass("Enter Proxmox root password: ")
+    if password == "":
         raise RuntimeError("Proxmox root password cannot be empty.")
     return password
 
@@ -131,7 +132,7 @@ def ensure_proxmox_password() -> str:
         return _PROXMOX_PASSWORD_CACHE
 
     cfg = load_config()
-    encrypted = str(cfg.get(PROXMOX_PASSWORD_KEY, "") or "").strip()
+    encrypted = cfg.get(PROXMOX_PASSWORD_KEY, "").strip()
     if encrypted:
         password = decrypt_secret(encrypted)
     else:
@@ -153,7 +154,7 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
     password = ensure_proxmox_password()
     client = paramiko.SSHClient()
     client.load_system_host_keys()
-    known_hosts = Path(str(cfg.get("ssh_known_hosts_path", "") or ""))
+    known_hosts = Path(cfg.get("ssh_known_hosts_path", ""))
     if known_hosts.exists():
         client.load_host_keys(str(known_hosts))
     client.set_missing_host_key_policy(paramiko.RejectPolicy())
@@ -184,11 +185,14 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
 
 
 def ssh_cmd(remote: str, timeout: int = 60) -> str:
-    with open_ssh_client(timeout=10) as client:
+    client = open_ssh_client(timeout=10)
+    try:
         _, stdout, stderr = client.exec_command(remote, timeout=timeout)
         exit_code = stdout.channel.recv_exit_status()
         out = stdout.read().decode(errors="replace").strip()
         err = stderr.read().decode(errors="replace").strip()
+    finally:
+        client.close()
     if exit_code:
         raise RuntimeError(err or out or f"command failed: {remote}")
     return out
