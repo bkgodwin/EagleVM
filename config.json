@@ -10,6 +10,9 @@
   "max_sessions": 25,
   "session_ttl_seconds": 600,
   "boot_timeout_seconds": 90,
+  "is_gui": false,
+  "gui_vm_username": "",
+  "gui_vm_password_encrypted": "",
   "local_network_blocklist": [
     "10.0.0.0/8",
     "172.16.0.0/12",

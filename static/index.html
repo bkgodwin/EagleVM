@@ -21,6 +21,8 @@
     </form>
     <div id="status" role="status" aria-live="polite" aria-atomic="true"></div>
   </main>
+
+  <!-- Terminal mode -->
   <section id="terminal-wrap" hidden>
     <div id="terminal"></div>
     <div id="session-banner">
@@ -30,6 +32,43 @@
       <span class="warning">Session remains available for a limited reconnect window after disconnect.</span>
     </div>
   </section>
+
+  <!-- GUI mode -->
+  <section id="gui-wrap" hidden>
+    <div id="vnc-canvas"></div>
+    <div id="gui-session-banner">
+      <span id="gui-container-name">Container: -</span>
+      <span id="gui-container-ip">IPv4: -</span>
+      <span id="gui-username-display" class="creds-badge"></span>
+      <span id="gui-password-display" class="creds-badge"></span>
+      <span class="warning">Session remains available for a limited reconnect window after disconnect.</span>
+    </div>
+  </section>
+
+  <!-- Credentials modal (shown before connecting in GUI mode) -->
+  <section id="credentials-modal" hidden>
+    <div id="credentials-window" role="dialog" aria-modal="true" aria-labelledby="creds-title">
+      <div id="creds-header">
+        <h2 id="creds-title">VM Login Credentials</h2>
+      </div>
+      <div id="creds-body">
+        <p class="creds-intro">Use these credentials to log in to the desktop environment inside the virtual machine.</p>
+        <table class="creds-table">
+          <tr>
+            <td>Username</td>
+            <td><span id="creds-username" class="creds-value">-</span></td>
+          </tr>
+          <tr>
+            <td>Password</td>
+            <td><span id="creds-password" class="creds-value">-</span></td>
+          </tr>
+        </table>
+        <p class="creds-note">These credentials are also shown in the bottom bar while your session is active.</p>
+      </div>
+      <button id="creds-connect-btn" type="button">Connect to Desktop</button>
+    </div>
+  </section>
+
   <section id="help-modal" hidden>
     <div id="help-window" role="dialog" aria-modal="true" aria-labelledby="help-title">
       <div id="help-header">

@@ -33,16 +33,23 @@ SESSION_HISTORY_PATH = STATE_DIR / "session_history.csv"
 LOCK_PATH = STATE_DIR / "sessions.lock"
 SECRET_KEY_PATH = STATE_DIR / "secret.key"
 PROXMOX_PASSWORD_KEY = "proxmox_root_password_encrypted"
+GUI_VM_PASSWORD_KEY = "gui_vm_password_encrypted"
 CLIENT_COOKIE_NAME = "lxchoster_client_id"
 SESSION_HISTORY_FIELDS = ["client_id", "session_id", "vmid", "hostname", "status", "updated_at"]
 COOKIE_MAX_AGE_SECONDS = 31536000
 MAX_CLIENT_ID_LENGTH = 120
+# Validation pattern for the GUI OS username: must start with a letter, followed by
+# up to 31 alphanumeric characters or the symbols . _ @ - (max 32 chars total).
+GUI_VM_USERNAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.@-]{0,31}$")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_state()
     await asyncio.to_thread(ensure_proxmox_password)
+    cfg = load_config()
+    if cfg.get("is_gui", False):
+        await asyncio.to_thread(ensure_gui_vm_password)
     cleanup_task = asyncio.create_task(cleanup_loop())
     try:
         yield
@@ -56,6 +63,7 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("lxchoster")
 _PROXMOX_PASSWORD_CACHE: str | None = None
+_GUI_VM_PASSWORD_CACHE: str | None = None
 _FERNET_CACHE: Fernet | None = None
 
 
@@ -70,6 +78,9 @@ def load_config() -> dict[str, Any]:
     cfg.setdefault("max_sessions", 25)
     cfg.setdefault("session_ttl_seconds", 600)
     cfg.setdefault("boot_timeout_seconds", 90)
+    cfg.setdefault("is_gui", False)
+    cfg.setdefault("gui_vm_username", "")
+    cfg.setdefault(GUI_VM_PASSWORD_KEY, "")
     cfg.setdefault(
         "local_network_blocklist",
         [
@@ -319,6 +330,39 @@ def ensure_proxmox_password() -> str:
     return password
 
 
+def ensure_gui_vm_password() -> str:
+    """Load, decrypt, or prompt for the GUI VM user password.
+
+    The password is stored encrypted in config.json under ``gui_vm_password_encrypted``.
+    If the field is blank and an interactive terminal is available the admin is prompted once
+    and the encrypted value is persisted.  Returns an empty string when ``is_gui`` is enabled
+    but no password has been configured and no terminal is available (non-fatal).
+    """
+    global _GUI_VM_PASSWORD_CACHE
+    if _GUI_VM_PASSWORD_CACHE is not None:
+        return _GUI_VM_PASSWORD_CACHE
+
+    cfg = load_config()
+    encrypted = cfg.get(GUI_VM_PASSWORD_KEY, "").strip()
+    if encrypted:
+        password = decrypt_secret(encrypted)
+    elif os.isatty(0):
+        password = getpass.getpass("Enter GUI VM user password (displayed to session users): ")
+        if password:
+            cfg[GUI_VM_PASSWORD_KEY] = encrypt_secret(password)
+            save_config(cfg)
+            logger.info("Encrypted GUI VM password stored in %s", CONFIG_PATH)
+    else:
+        logger.warning(
+            "is_gui is enabled but gui_vm_password_encrypted is not set. "
+            "No credentials will be shown. Set it in %s.",
+            CONFIG_PATH,
+        )
+        password = ""
+    _GUI_VM_PASSWORD_CACHE = password
+    return password
+
+
 def active_session_count(state: dict[str, Any]) -> int:
     """Return the number of currently active sessions (creating/running)."""
     return sum(1 for session in state.values() if session.get("status") in {"creating", "running"})
@@ -449,6 +493,55 @@ async def wait_for_container(vmid: int, timeout: int) -> str:
     raise TimeoutError("container did not boot with an IPv4 address")
 
 
+async def start_gui_services(vmid: int, vnc_password: str) -> None:
+    """Start Xvfb, a desktop environment, and x11vnc inside the container.
+
+    The container template must have ``xvfb``, ``x11vnc``, and at least one of
+    ``xfce4``, ``openbox``, or ``fluxbox`` installed.  All processes are started
+    in the background with ``nohup`` so they outlive the ``pct exec`` shell.
+
+    A per-session VNC password is written to ``/tmp/.vncpw`` inside the container
+    and passed to x11vnc via ``-rfbauth`` for defense-in-depth.  The password
+    contains only hex characters (0-9, a-f) and is safe to embed unquoted.
+    """
+    # vnc_password is secrets.token_hex(4): hex chars only, safe to embed without quoting.
+    script = (
+        "set -e; "
+        "export DISPLAY=:99; "
+        "nohup Xvfb :99 -screen 0 1280x800x24 -ac >/tmp/xvfb.log 2>&1 & "
+        "sleep 2; "
+        "if command -v startxfce4 >/dev/null 2>&1; then "
+        "  nohup startxfce4 >/tmp/desktop.log 2>&1 & "
+        "elif command -v openbox-session >/dev/null 2>&1; then "
+        "  nohup openbox-session >/tmp/desktop.log 2>&1 & "
+        "elif command -v fluxbox >/dev/null 2>&1; then "
+        "  nohup fluxbox >/tmp/desktop.log 2>&1 & "
+        "fi; "
+        "sleep 1; "
+        f"x11vnc -storepasswd {vnc_password} /tmp/.vncpw; "
+        "nohup x11vnc -display :99 -rfbauth /tmp/.vncpw -forever -rfbport 5900 >/tmp/x11vnc.log 2>&1 &"
+    )
+    await run_ssh(f"pct exec {vmid} -- bash -c {shlex.quote(script)}", timeout=30)
+
+
+async def wait_for_vnc(vmid: int, timeout: int) -> None:
+    """Poll until x11vnc is listening on port 5900 inside the container."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            out = await run_ssh(
+                f"pct exec {vmid} -- bash -c "
+                "'ss -tlnp 2>/dev/null | grep -q :5900 && echo ok || true'",
+                timeout=10,
+            )
+            if out.strip() == "ok":
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+    raise TimeoutError("VNC server (x11vnc) did not start within timeout")
+
+
 def clamp_terminal_size(rows: int, cols: int) -> tuple[int, int]:
     rows = max(10, min(int(rows), 200))
     cols = max(20, min(int(cols), 400))
@@ -468,7 +561,12 @@ async def favicon():
 @app.post("/api/session")
 async def launch(request: Request):
     cfg = load_config()
+    is_gui = bool(cfg.get("is_gui", False))
+    gui_vm_username = str(cfg.get("gui_vm_username", "")).strip() if is_gui else ""
+    gui_vm_password = ensure_gui_vm_password() if is_gui else ""
     password = secrets.token_urlsafe(24)
+    # Per-session VNC password (8 hex chars) used for defense-in-depth VNC auth.
+    vnc_password = secrets.token_hex(4) if is_gui else ""
     now = int(time.time())
     session_ttl = int(cfg["session_ttl_seconds"])
     presented_client_id = normalize_client_id(request.cookies.get(CLIENT_COOKIE_NAME))
@@ -492,15 +590,19 @@ async def launch(request: Request):
                 state[remembered_session_id] = remembered_session
                 write_state(state)
                 upsert_session_history(issued_client_id, remembered_session_id, remembered_session, now)
-                response = JSONResponse(
-                    {
-                        "session_id": remembered_session_id,
-                        "vmid": remembered_session["vmid"],
-                        "hostname": remembered_session["hostname"],
-                        "ip": remembered_session["ip"],
-                        "reused": True,
-                    }
-                )
+                payload: dict[str, Any] = {
+                    "session_id": remembered_session_id,
+                    "vmid": remembered_session["vmid"],
+                    "hostname": remembered_session["hostname"],
+                    "ip": remembered_session["ip"],
+                    "reused": True,
+                    "is_gui": is_gui,
+                }
+                if is_gui:
+                    payload["gui_vm_username"] = gui_vm_username
+                    payload["gui_vm_password"] = gui_vm_password
+                    payload["gui_vnc_password"] = str(remembered_session.get("vnc_password", ""))
+                response = JSONResponse(payload)
                 attach_client_cookie(response, request, issued_client_id)
                 return response
             history_rows = [
@@ -525,6 +627,8 @@ async def launch(request: Request):
             "status": "creating",
             "created_at": now,
             "last_seen": now,
+            "is_gui": is_gui,
+            "vnc_password": vnc_password,
         }
         write_state(state)
         upsert_session_history(issued_client_id, session_id, state[session_id], now)
@@ -545,8 +649,25 @@ async def launch(request: Request):
             f"pct exec {vmid} -- sh -lc '{{ printf root:; printf {password_b64} | base64 -d; printf \"\\n\"; }} | chpasswd'",
             timeout=60,
         )
+        if is_gui and gui_vm_username and gui_vm_password:
+            if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
+                gui_pw_b64 = base64.b64encode(gui_vm_password.encode()).decode()
+                await run_ssh(
+                    f"pct exec {vmid} -- sh -lc "
+                    f"'{{ printf {shlex.quote(gui_vm_username)}:; printf {gui_pw_b64} | base64 -d; "
+                    f"printf \"\\n\"; }} | chpasswd'",
+                    timeout=60,
+                )
+            else:
+                logger.warning(
+                    "gui_vm_username %r contains invalid characters; skipping chpasswd",
+                    gui_vm_username,
+                )
         await apply_network_restrictions(vmid, cfg)
         ip = await wait_for_container(vmid, int(cfg["boot_timeout_seconds"]))
+        if is_gui:
+            await start_gui_services(vmid, vnc_password)
+            await wait_for_vnc(vmid, int(cfg["boot_timeout_seconds"]))
     except Exception as exc:
         await cleanup_session(session_id, f"create_failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
@@ -557,15 +678,19 @@ async def launch(request: Request):
         write_state(state)
         upsert_session_history(issued_client_id, session_id, state[session_id], int(time.time()))
         logger.info(
-            "Session created id=%s vmid=%s hostname=%s active_sessions=%d",
+            "Session created id=%s vmid=%s hostname=%s is_gui=%s active_sessions=%d",
             session_id,
             vmid,
             hostname,
+            is_gui,
             active_session_count(state),
         )
-    response = JSONResponse(
-        {"session_id": session_id, "vmid": vmid, "hostname": hostname, "ip": ip, "reused": False}
-    )
+    payload = {"session_id": session_id, "vmid": vmid, "hostname": hostname, "ip": ip, "reused": False, "is_gui": is_gui}
+    if is_gui:
+        payload["gui_vm_username"] = gui_vm_username
+        payload["gui_vm_password"] = gui_vm_password
+        payload["gui_vnc_password"] = vnc_password
+    response = JSONResponse(payload)
     attach_client_cookie(response, request, issued_client_id)
     return response
 
@@ -659,6 +784,126 @@ async def terminal(websocket: WebSocket, session_id: str):
     try:
         completed_tasks, pending_tasks = await asyncio.wait(
             {pty_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending_tasks:
+            task.cancel()
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        for task in completed_tasks:
+            exc = task.exception()
+            if exc and not isinstance(exc, WebSocketDisconnect):
+                raise exc
+    except WebSocketDisconnect:
+        pass
+    finally:
+        channel.close()
+        client.close()
+        # Keep sessions reconnectable until inactivity timeout instead of destroying on disconnect.
+        with StateLock():
+            state = read_state()
+            if session_id in state and state[session_id].get("status") in {"creating", "running"}:
+                state[session_id]["last_seen"] = int(time.time())
+                write_state(state)
+                if client_id:
+                    upsert_session_history(client_id, session_id, state[session_id], int(time.time()))
+
+
+@app.websocket("/ws-gui/{session_id}")
+async def gui_session(websocket: WebSocket, session_id: str):
+    """WebSocket endpoint that proxies binary RFB (VNC) traffic to x11vnc inside the container.
+
+    noVNC in the browser connects here.  An SSH ``direct-tcpip`` channel tunnels the traffic
+    from the Proxmox host to the container's VNC port (5900) without exposing it externally.
+    """
+    validate_session_id(session_id)
+    await websocket.accept(subprotocol="binary")
+
+    with StateLock():
+        state = read_state()
+        session = state.get(session_id)
+        if not session or session.get("status") != "running" or not session.get("is_gui"):
+            await websocket.close(code=1008)
+            return
+        session["last_seen"] = int(time.time())
+        state[session_id] = session
+        write_state(state)
+        if session.get("client_id"):
+            upsert_session_history(session["client_id"], session_id, session, int(time.time()))
+
+    container_ip = str(session["ip"])
+    client_id = str(session.get("client_id", ""))
+
+    client = await asyncio.to_thread(open_ssh_client, 10)
+    transport = client.get_transport()
+    if transport is None:
+        logger.error("Failed to open SSH transport for gui session_id=%s", session_id)
+        client.close()
+        await websocket.close(code=1011)
+        return
+
+    try:
+        channel = await asyncio.to_thread(
+            transport.open_channel,
+            "direct-tcpip",
+            (container_ip, 5900),
+            ("127.0.0.1", 0),
+        )
+    except Exception as exc:
+        logger.error("Failed to open VNC channel for session %s: %s", session_id, exc)
+        client.close()
+        await websocket.close(code=1011)
+        return
+
+    async def vnc_to_ws():
+        while True:
+            if await asyncio.to_thread(channel.recv_ready):
+                data = await asyncio.to_thread(channel.recv, 16384)
+                if not data:
+                    break
+                if (
+                    websocket.application_state != WebSocketState.CONNECTED
+                    or websocket.client_state != WebSocketState.CONNECTED
+                ):
+                    break
+                try:
+                    await websocket.send_bytes(data)
+                except RuntimeError:
+                    if (
+                        websocket.application_state != WebSocketState.CONNECTED
+                        or websocket.client_state != WebSocketState.CONNECTED
+                    ):
+                        break
+                    raise
+                continue
+            if await asyncio.to_thread(lambda: channel.closed):
+                break
+            await asyncio.sleep(0.1)
+
+    async def ws_to_vnc():
+        while True:
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                break
+            if msg.get("type") != "websocket.receive":
+                break
+            with StateLock():
+                state = read_state()
+                if session_id in state:
+                    state[session_id]["last_seen"] = int(time.time())
+                    write_state(state)
+            data: bytes | None = None
+            if "bytes" in msg and msg["bytes"] is not None:
+                data = msg["bytes"]
+            elif "text" in msg and msg["text"] is not None:
+                data = msg["text"].encode()
+            if data:
+                await asyncio.to_thread(channel.send, data)
+
+    ws_task = asyncio.create_task(ws_to_vnc())
+    vnc_task = asyncio.create_task(vnc_to_ws())
+    try:
+        completed_tasks, pending_tasks = await asyncio.wait(
+            {vnc_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
         )
         for task in pending_tasks:
             task.cancel()
