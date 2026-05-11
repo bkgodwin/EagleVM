@@ -195,7 +195,7 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
 
 
 def ssh_cmd(remote: str, timeout: int = 60) -> str:
-    client = open_ssh_client(timeout=10)
+    client = open_ssh_client(timeout=timeout)
     try:
         _, stdout, stderr = client.exec_command(remote, timeout=timeout)
         exit_code = stdout.channel.recv_exit_status()
@@ -364,6 +364,7 @@ async def terminal(websocket: WebSocket, session_id: str):
     client = open_ssh_client(timeout=10)
     transport = client.get_transport()
     if transport is None:
+        logger.error("Failed to open SSH transport for session_id=%s vmid=%s", session_id, vmid)
         client.close()
         await websocket.close(code=1011)
         return
