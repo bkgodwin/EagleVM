@@ -371,26 +371,26 @@ async def terminal(websocket: WebSocket, session_id: str):
         write_state(state)
 
     vmid = int(session["vmid"])
-    client = open_ssh_client(timeout=10)
+    client = await asyncio.to_thread(open_ssh_client, 10)
     transport = client.get_transport()
     if transport is None:
         logger.error("Failed to open SSH transport for session_id=%s vmid=%s", session_id, vmid)
         client.close()
         await websocket.close(code=1011)
         return
-    channel = transport.open_session(timeout=10)
-    channel.get_pty(term="xterm", width=80, height=24)
-    channel.exec_command(f"pct exec {vmid} -- bash -l")
+    channel = await asyncio.to_thread(transport.open_session, timeout=10)
+    await asyncio.to_thread(channel.get_pty, term="xterm", width=80, height=24)
+    await asyncio.to_thread(channel.exec_command, f"pct exec {vmid} -- bash -l")
 
     async def pty_to_ws():
         while True:
-            if channel.recv_ready():
-                data = channel.recv(4096)
+            if await asyncio.to_thread(channel.recv_ready):
+                data = await asyncio.to_thread(channel.recv, 4096)
                 if not data:
                     break
                 await websocket.send_bytes(data)
                 continue
-            if channel.exit_status_ready():
+            if await asyncio.to_thread(channel.exit_status_ready):
                 break
             await asyncio.sleep(0.05)
 
@@ -403,20 +403,20 @@ async def terminal(websocket: WebSocket, session_id: str):
                     state[session_id]["last_seen"] = int(time.time())
                     write_state(state)
             if "bytes" in msg and msg["bytes"] is not None:
-                channel.send(msg["bytes"])
+                await asyncio.to_thread(channel.send, msg["bytes"])
             elif "text" in msg and msg["text"] is not None:
                 text = msg["text"]
                 try:
                     payload = json.loads(text)
                     if payload.get("type") == "input":
-                        channel.send(str(payload.get("data", "")).encode())
+                        await asyncio.to_thread(channel.send, str(payload.get("data", "")).encode())
                     elif payload.get("type") == "resize":
                         rows, cols = clamp_terminal_size(
                             int(payload.get("rows", 24)), int(payload.get("cols", 80))
                         )
-                        channel.resize_pty(width=cols, height=rows)
+                        await asyncio.to_thread(channel.resize_pty, width=cols, height=rows)
                 except json.JSONDecodeError:
-                    channel.send(text.encode())
+                    await asyncio.to_thread(channel.send, text.encode())
 
     try:
         await asyncio.gather(pty_to_ws(), ws_to_pty())
