@@ -138,7 +138,7 @@ button:disabled {
 #help-modal {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, .72);
+  background: rgba(0, 0, 0, 0.72);
   display: grid;
   place-items: center;
   padding: 20px;

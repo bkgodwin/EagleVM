@@ -6,6 +6,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import shlex
 import socket
 import secrets
@@ -33,6 +34,7 @@ LOCK_PATH = STATE_DIR / "sessions.lock"
 SECRET_KEY_PATH = STATE_DIR / "secret.key"
 PROXMOX_PASSWORD_KEY = "proxmox_root_password_encrypted"
 CLIENT_COOKIE_NAME = "lxchoster_client_id"
+SESSION_HISTORY_FIELDS = ["client_id", "session_id", "vmid", "hostname", "status", "updated_at"]
 
 
 @asynccontextmanager
@@ -97,7 +99,7 @@ def init_state() -> None:
     if not STATE_PATH.exists():
         STATE_PATH.write_text("{}")
     if not SESSION_HISTORY_PATH.exists():
-        SESSION_HISTORY_PATH.write_text("client_id,session_id,vmid,hostname,status,updated_at\n")
+        SESSION_HISTORY_PATH.write_text(",".join(SESSION_HISTORY_FIELDS) + "\n")
 
 
 class StateLock:
@@ -151,10 +153,7 @@ def read_session_history() -> list[dict[str, str]]:
 def write_session_history(rows: list[dict[str, str]]) -> None:
     tmp = SESSION_HISTORY_PATH.with_suffix(".tmp")
     with tmp.open("w", newline="") as fh:
-        writer = csv.DictWriter(
-            fh,
-            fieldnames=["client_id", "session_id", "vmid", "hostname", "status", "updated_at"],
-        )
+        writer = csv.DictWriter(fh, fieldnames=SESSION_HISTORY_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
     tmp.replace(SESSION_HISTORY_PATH)
@@ -164,7 +163,7 @@ def upsert_session_history(client_id: str, session_id: str, session: dict[str, A
     rows = [
         row
         for row in read_session_history()
-        if row.get("client_id") != client_id and row.get("session_id") != session_id
+        if row.get("client_id") != client_id or row.get("session_id") != session_id
     ]
     rows.append(
         {
@@ -193,6 +192,17 @@ def attach_client_cookie(response: JSONResponse, request: Request, client_id: st
         samesite="lax",
         secure=request.url.scheme == "https",
     )
+
+
+def normalize_client_id(value: str | None) -> str:
+    if not value:
+        return secrets.token_urlsafe(18)
+    cleaned = value.strip()
+    if len(cleaned) > 120:
+        return secrets.token_urlsafe(18)
+    if not re.fullmatch(r"[A-Za-z0-9._~-]+", cleaned):
+        return secrets.token_urlsafe(18)
+    return cleaned
 
 
 async def apply_network_restrictions(vmid: int, cfg: dict[str, Any]) -> None:
@@ -453,7 +463,7 @@ async def launch(request: Request):
     password = secrets.token_urlsafe(24)
     now = int(time.time())
     session_ttl = int(cfg["session_ttl_seconds"])
-    client_id = request.cookies.get(CLIENT_COOKIE_NAME) or secrets.token_urlsafe(18)
+    client_id = normalize_client_id(request.cookies.get(CLIENT_COOKIE_NAME))
     with StateLock():
         state = read_state()
         history_rows = read_session_history()
