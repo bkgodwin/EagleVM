@@ -25,7 +25,7 @@ cd /opt/lxchoster
 python3 app.py
 ```
 
-By default this listens on port `8000`. Override with `PORT=<port>`.
+By default this listens on `127.0.0.1:8000`. Override with `HOST=<host>` and/or `PORT=<port>`.
 Session lifecycle events are logged to the terminal, including active session count on create/delete.
 
 Restart:

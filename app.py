@@ -343,6 +343,7 @@ async def startup():
 
 
 if __name__ == "__main__":
+    host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8000"))
-    logger.info("Starting LXChoster in foreground on 0.0.0.0:%d", port)
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    logger.info("Starting LXChoster in foreground on %s:%d", host, port)
+    uvicorn.run("app:app", host=host, port=port)

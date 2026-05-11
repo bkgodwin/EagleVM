@@ -62,9 +62,6 @@ button {
   padding: 10px 14px;
   border-radius: 6px;
   font: inherit;
-}
-
-button {
   border: 0;
   background: #36d46b;
   color: #041108;
