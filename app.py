@@ -5,6 +5,7 @@ import getpass
 import json
 import logging
 import os
+import socket
 import secrets
 import time
 from pathlib import Path
@@ -163,9 +164,13 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
     password = ensure_proxmox_password()
     client = paramiko.SSHClient()
     client.load_system_host_keys()
-    known_hosts = Path(cfg.get("ssh_known_hosts_path", ""))
-    if known_hosts.exists():
-        client.load_host_keys(str(known_hosts))
+    known_hosts_value = cfg.get("ssh_known_hosts_path", "")
+    known_hosts_display = "system known_hosts"
+    if known_hosts_value:
+        known_hosts = Path(known_hosts_value)
+        known_hosts_display = str(known_hosts)
+        if known_hosts.exists():
+            client.load_host_keys(str(known_hosts))
     client.set_missing_host_key_policy(paramiko.RejectPolicy())
     try:
         client.connect(
@@ -182,8 +187,8 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
         client.close()
         raise RuntimeError(
             f"SSH host key verification failed for {cfg['proxmox_host']}. "
-            f"Add the host key to {known_hosts} or system known_hosts "
-            f"(for example: ssh-keyscan -H {cfg['proxmox_host']} >> {known_hosts})."
+            f"Add the host key to {known_hosts_display} or system known_hosts "
+            f"(for example: ssh-keyscan -H {cfg['proxmox_host']} >> {known_hosts_display})."
         ) from exc
     except paramiko.AuthenticationException as exc:
         client.close()
@@ -198,9 +203,14 @@ def ssh_cmd(remote: str, timeout: int = 60) -> str:
     client = open_ssh_client(timeout=timeout)
     try:
         _, stdout, stderr = client.exec_command(remote, timeout=timeout)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode(errors="replace").strip()
-        err = stderr.read().decode(errors="replace").strip()
+        stdout.channel.settimeout(timeout)
+        stderr.channel.settimeout(timeout)
+        try:
+            exit_code = stdout.channel.recv_exit_status()
+            out = stdout.read().decode(errors="replace").strip()
+            err = stderr.read().decode(errors="replace").strip()
+        except socket.timeout as exc:
+            raise RuntimeError(f"Remote command timed out after {timeout} seconds.") from exc
     finally:
         client.close()
     if exit_code:
