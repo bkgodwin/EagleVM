@@ -39,6 +39,7 @@ def load_config() -> dict[str, Any]:
         cfg = json.load(fh)
     cfg.setdefault("ssh_user", "root")
     cfg.setdefault("ssh_key_path", "/opt/lxchoster/.ssh/id_ed25519")
+    cfg.setdefault("ssh_known_hosts_path", str(BASE_DIR / "known_hosts"))
     cfg.setdefault(PROXMOX_PASSWORD_KEY, "")
     cfg.setdefault("storage", "local-lvm")
     cfg.setdefault("bridge", "vmbr0")
@@ -116,7 +117,8 @@ def decrypt_secret(value: str) -> str:
 def prompt_for_proxmox_password() -> str:
     if not os.isatty(0):
         raise RuntimeError(
-            "No encrypted Proxmox root password is configured and no interactive terminal is available."
+            "No encrypted Proxmox root password is configured and no interactive terminal is available. "
+            "Start once in an interactive terminal to save it, or set proxmox_root_password_encrypted in config.json."
         )
     password = getpass.getpass("Enter Proxmox root password: ").strip()
     if not password:
@@ -151,23 +153,35 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
     cfg = load_config()
     password = ensure_proxmox_password()
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=cfg["proxmox_host"],
-        username=cfg["ssh_user"],
-        password=password,
-        timeout=timeout,
-        banner_timeout=timeout,
-        auth_timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+    client.load_system_host_keys()
+    known_hosts = Path(str(cfg.get("ssh_known_hosts_path", "") or ""))
+    if known_hosts.exists():
+        client.load_host_keys(str(known_hosts))
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    try:
+        client.connect(
+            hostname=cfg["proxmox_host"],
+            username=cfg["ssh_user"],
+            password=password,
+            timeout=timeout,
+            banner_timeout=timeout,
+            auth_timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+    except paramiko.SSHException as exc:
+        client.close()
+        raise RuntimeError(
+            f"SSH host key verification failed for {cfg['proxmox_host']}. "
+            f"Add the host key to {known_hosts} or system known_hosts."
+        ) from exc
     return client
 
 
 def ssh_cmd(remote: str, timeout: int = 60) -> str:
     with open_ssh_client(timeout=10) as client:
-        _stdin, stdout, stderr = client.exec_command(remote, timeout=timeout)
+        stdin, stdout, stderr = client.exec_command(remote, timeout=timeout)
+        del stdin
         exit_code = stdout.channel.recv_exit_status()
         out = stdout.read().decode(errors="replace").strip()
         err = stderr.read().decode(errors="replace").strip()
@@ -349,7 +363,7 @@ async def terminal(websocket: WebSocket, session_id: str):
                 continue
             if channel.exit_status_ready():
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
 
     async def ws_to_pty():
         while True:

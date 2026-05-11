@@ -3,6 +3,7 @@
   "proxmox_host": "192.168.0.10",
   "node": "pve",
   "ssh_user": "root",
+  "ssh_known_hosts_path": "/opt/lxchoster/known_hosts",
   "proxmox_root_password_encrypted": "",
   "ssh_key_path": "/opt/lxchoster/.ssh/id_ed25519",
   "storage": "local-lvm",

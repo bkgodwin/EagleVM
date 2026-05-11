@@ -10,6 +10,7 @@ Edit `/opt/lxchoster/config.json`.
 
 - `template_id`: Proxmox LXC template VMID to clone.
 - `proxmox_root_password_encrypted`: encrypted Proxmox root password. Leave blank initially to be prompted at startup.
+- `ssh_known_hosts_path`: path to known_hosts file used to verify the Proxmox SSH host key.
 - `max_sessions`: maximum concurrent temporary sessions. Default here is `25`.
 - `session_ttl_seconds`: inactivity timeout before cleanup.
 
