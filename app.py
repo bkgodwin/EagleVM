@@ -1,10 +1,12 @@
 import asyncio
 import base64
+import csv
 import fcntl
 import getpass
 import json
 import logging
 import os
+import shlex
 import socket
 import secrets
 import time
@@ -14,8 +16,9 @@ from typing import Any
 
 import paramiko
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
 import uvicorn
@@ -25,9 +28,11 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("LXCHOSTER_CONFIG", BASE_DIR / "config.json"))
 STATE_DIR = Path(os.environ.get("LXCHOSTER_STATE_DIR", "/var/lib/lxchoster"))
 STATE_PATH = STATE_DIR / "sessions.json"
+SESSION_HISTORY_PATH = STATE_DIR / "session_history.csv"
 LOCK_PATH = STATE_DIR / "sessions.lock"
 SECRET_KEY_PATH = STATE_DIR / "secret.key"
 PROXMOX_PASSWORD_KEY = "proxmox_root_password_encrypted"
+CLIENT_COOKIE_NAME = "lxchoster_client_id"
 
 
 @asynccontextmanager
@@ -59,8 +64,21 @@ def load_config() -> dict[str, Any]:
     cfg.setdefault("storage", "local-lvm")
     cfg.setdefault("bridge", "vmbr0")
     cfg.setdefault("max_sessions", 25)
-    cfg.setdefault("session_ttl_seconds", 3600)
+    cfg.setdefault("session_ttl_seconds", 600)
     cfg.setdefault("boot_timeout_seconds", 90)
+    cfg.setdefault(
+        "local_network_blocklist",
+        [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+            "100.64.0.0/10",
+            "fc00::/7",
+            "fe80::/10",
+        ],
+    )
+    cfg.setdefault("local_network_allowlist", [])
     return cfg
 
 
@@ -78,6 +96,8 @@ def init_state() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if not STATE_PATH.exists():
         STATE_PATH.write_text("{}")
+    if not SESSION_HISTORY_PATH.exists():
+        SESSION_HISTORY_PATH.write_text("client_id,session_id,vmid,hostname,status,updated_at\n")
 
 
 class StateLock:
@@ -104,6 +124,118 @@ def write_state(state: dict[str, Any]) -> None:
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
     tmp.replace(STATE_PATH)
+
+
+def read_session_history() -> list[dict[str, str]]:
+    init_state()
+    rows: list[dict[str, str]] = []
+    with SESSION_HISTORY_PATH.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            client_id = row.get("client_id", "").strip()
+            session_id = row.get("session_id", "").strip()
+            if client_id and session_id:
+                rows.append(
+                    {
+                        "client_id": client_id,
+                        "session_id": session_id,
+                        "vmid": row.get("vmid", "").strip(),
+                        "hostname": row.get("hostname", "").strip(),
+                        "status": row.get("status", "").strip(),
+                        "updated_at": row.get("updated_at", "").strip(),
+                    }
+                )
+    return rows
+
+
+def write_session_history(rows: list[dict[str, str]]) -> None:
+    tmp = SESSION_HISTORY_PATH.with_suffix(".tmp")
+    with tmp.open("w", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["client_id", "session_id", "vmid", "hostname", "status", "updated_at"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp.replace(SESSION_HISTORY_PATH)
+
+
+def upsert_session_history(client_id: str, session_id: str, session: dict[str, Any], now: int) -> None:
+    rows = [
+        row
+        for row in read_session_history()
+        if row.get("client_id") != client_id and row.get("session_id") != session_id
+    ]
+    rows.append(
+        {
+            "client_id": client_id,
+            "session_id": session_id,
+            "vmid": str(session.get("vmid", "")),
+            "hostname": str(session.get("hostname", "")),
+            "status": str(session.get("status", "")),
+            "updated_at": str(now),
+        }
+    )
+    write_session_history(rows)
+
+
+def remove_session_history(session_id: str) -> None:
+    rows = [row for row in read_session_history() if row.get("session_id") != session_id]
+    write_session_history(rows)
+
+
+def attach_client_cookie(response: JSONResponse, request: Request, client_id: str) -> None:
+    response.set_cookie(
+        key=CLIENT_COOKIE_NAME,
+        value=client_id,
+        max_age=31536000,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+    )
+
+
+async def apply_network_restrictions(vmid: int, cfg: dict[str, Any]) -> None:
+    blocklist = [str(item).strip() for item in cfg.get("local_network_blocklist", []) if str(item).strip()]
+    allowlist = [str(item).strip() for item in cfg.get("local_network_allowlist", []) if str(item).strip()]
+    allow_set = set(allowlist)
+    blocked = [cidr for cidr in blocklist if cidr not in allow_set]
+    if not blocked:
+        return
+
+    v4_allow = [cidr for cidr in allowlist if ":" not in cidr]
+    v6_allow = [cidr for cidr in allowlist if ":" in cidr]
+    v4_block = [cidr for cidr in blocked if ":" not in cidr]
+    v6_block = [cidr for cidr in blocked if ":" in cidr]
+
+    lines = ["set -eu"]
+    if v4_allow or v4_block:
+        lines.append("command -v iptables >/dev/null 2>&1 || { echo 'iptables missing' >&2; exit 1; }")
+        for cidr in v4_allow:
+            q = shlex.quote(cidr)
+            lines.append(
+                f"iptables -C OUTPUT -d {q} -j ACCEPT >/dev/null 2>&1 || iptables -I OUTPUT 1 -d {q} -j ACCEPT"
+            )
+        for cidr in v4_block:
+            q = shlex.quote(cidr)
+            lines.append(
+                f"iptables -C OUTPUT -d {q} -j REJECT >/dev/null 2>&1 || iptables -A OUTPUT -d {q} -j REJECT"
+            )
+    if v6_allow or v6_block:
+        lines.append("command -v ip6tables >/dev/null 2>&1 || { echo 'ip6tables missing' >&2; exit 1; }")
+        for cidr in v6_allow:
+            q = shlex.quote(cidr)
+            lines.append(
+                f"ip6tables -C OUTPUT -d {q} -j ACCEPT >/dev/null 2>&1 || ip6tables -I OUTPUT 1 -d {q} -j ACCEPT"
+            )
+        for cidr in v6_block:
+            q = shlex.quote(cidr)
+            lines.append(
+                f"ip6tables -C OUTPUT -d {q} -j REJECT >/dev/null 2>&1 || ip6tables -A OUTPUT -d {q} -j REJECT"
+            )
+
+    script = "\n".join(lines)
+    await run_ssh(f"pct exec {vmid} -- sh -lc {shlex.quote(script)}", timeout=60)
 
 
 def get_fernet() -> Fernet:
@@ -276,6 +408,7 @@ async def cleanup_session(session_id: str, reason: str = "cleanup") -> None:
             "cleanup_reason": reason,
         }
         write_state(state)
+        remove_session_history(session_id)
         logger.info(
             "Session deleted id=%s vmid=%s reason=%s active_sessions=%d",
             session_id,
@@ -315,12 +448,45 @@ async def favicon():
 
 
 @app.post("/api/session")
-async def launch():
+async def launch(request: Request):
     cfg = load_config()
     password = secrets.token_urlsafe(24)
     now = int(time.time())
+    session_ttl = int(cfg["session_ttl_seconds"])
+    client_id = request.cookies.get(CLIENT_COOKIE_NAME) or secrets.token_urlsafe(18)
     with StateLock():
         state = read_state()
+        history_rows = read_session_history()
+        history_by_client = {row["client_id"]: row for row in history_rows}
+        remembered = history_by_client.get(client_id)
+        if remembered:
+            remembered_session_id = remembered.get("session_id", "")
+            remembered_session = state.get(remembered_session_id)
+            if (
+                remembered_session
+                and remembered_session.get("status") == "running"
+                and int(remembered_session.get("last_seen", 0)) >= (now - session_ttl)
+            ):
+                remembered_session["last_seen"] = now
+                state[remembered_session_id] = remembered_session
+                write_state(state)
+                upsert_session_history(client_id, remembered_session_id, remembered_session, now)
+                response = JSONResponse(
+                    {
+                        "session_id": remembered_session_id,
+                        "vmid": remembered_session["vmid"],
+                        "hostname": remembered_session["hostname"],
+                        "ip": remembered_session["ip"],
+                        "reused": True,
+                    }
+                )
+                attach_client_cookie(response, request, client_id)
+                return response
+            history_rows = [
+                row for row in history_rows if row.get("client_id") != client_id
+            ]
+            write_session_history(history_rows)
+
         active = [s for s in state.values() if s.get("status") in {"creating", "running"}]
         if len(active) >= int(cfg["max_sessions"]):
             raise HTTPException(status_code=429, detail="Maximum active sessions reached.")
@@ -334,11 +500,13 @@ async def launch():
         state[session_id] = {
             "vmid": vmid,
             "hostname": hostname,
+            "client_id": client_id,
             "status": "creating",
             "created_at": now,
             "last_seen": now,
         }
         write_state(state)
+        upsert_session_history(client_id, session_id, state[session_id], now)
 
     try:
         await run_ssh(
@@ -356,6 +524,7 @@ async def launch():
             f"pct exec {vmid} -- sh -lc '{{ printf root:; printf {password_b64} | base64 -d; printf \"\\n\"; }} | chpasswd'",
             timeout=60,
         )
+        await apply_network_restrictions(vmid, cfg)
         ip = await wait_for_container(vmid, int(cfg["boot_timeout_seconds"]))
     except Exception as exc:
         await cleanup_session(session_id, f"create_failed: {exc}")
@@ -365,6 +534,7 @@ async def launch():
         state = read_state()
         state[session_id].update({"status": "running", "ip": ip, "last_seen": int(time.time())})
         write_state(state)
+        upsert_session_history(client_id, session_id, state[session_id], int(time.time()))
         logger.info(
             "Session created id=%s vmid=%s hostname=%s active_sessions=%d",
             session_id,
@@ -372,7 +542,11 @@ async def launch():
             hostname,
             active_session_count(state),
         )
-    return {"session_id": session_id, "vmid": vmid, "hostname": hostname, "ip": ip}
+    response = JSONResponse(
+        {"session_id": session_id, "vmid": vmid, "hostname": hostname, "ip": ip, "reused": False}
+    )
+    attach_client_cookie(response, request, client_id)
+    return response
 
 
 @app.websocket("/ws/{session_id}")
@@ -389,8 +563,11 @@ async def terminal(websocket: WebSocket, session_id: str):
         session["last_seen"] = int(time.time())
         state[session_id] = session
         write_state(state)
+        if session.get("client_id"):
+            upsert_session_history(session["client_id"], session_id, session, int(time.time()))
 
     vmid = int(session["vmid"])
+    client_id = str(session.get("client_id", ""))
     client = await asyncio.to_thread(open_ssh_client, 10)
     transport = client.get_transport()
     if transport is None:
@@ -474,7 +651,13 @@ async def terminal(websocket: WebSocket, session_id: str):
     finally:
         channel.close()
         client.close()
-        await cleanup_session(session_id, "websocket_disconnect")
+        with StateLock():
+            state = read_state()
+            if session_id in state and state[session_id].get("status") in {"creating", "running"}:
+                state[session_id]["last_seen"] = int(time.time())
+                write_state(state)
+                if client_id:
+                    upsert_session_history(client_id, session_id, state[session_id], int(time.time()))
 
 
 async def cleanup_loop():
@@ -496,8 +679,8 @@ async def cleanup_loop():
 
 
 if __name__ == "__main__":
-    host = os.environ.get("HOST", "127.0.0.1")
-    port_raw = os.environ.get("PORT", "8000")
+    host = os.environ.get("HOST", "0.0.0.0")
+    port_raw = os.environ.get("PORT", "5000")
     try:
         port = int(port_raw)
     except ValueError as exc:
