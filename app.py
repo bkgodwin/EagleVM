@@ -418,7 +418,10 @@ async def terminal(websocket: WebSocket, session_id: str):
 
     async def ws_to_pty():
         while True:
-            msg = await websocket.receive()
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                break
             if msg["type"] == "websocket.disconnect":
                 break
             with StateLock():
