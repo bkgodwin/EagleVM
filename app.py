@@ -41,6 +41,13 @@ CLIENT_COOKIE_NAME = "lxchoster_client_id"
 # new paramiko connection.  Kept separate from the *command* timeout so that the
 # hard asyncio-level safety timeouts applied to the polling loops are correct.
 _SSH_CONNECT_TIMEOUT = 15
+# Maximum seconds allowed for a single SSH command during the IP-polling loops.
+_MAX_POLL_CMD_TIMEOUT = 15
+# Additional seconds added to the polling-loop timeout when computing the hard
+# asyncio-level safety timeout (covers connection setup + a small buffer).
+_TIMEOUT_BUFFER_SECONDS = 5
+# Timeout for the one-shot get_vm_mac() call before the polling loop begins.
+_MAC_LOOKUP_TIMEOUT = 20
 SESSION_HISTORY_FIELDS = ["client_id", "session_id", "vmid", "hostname", "status", "updated_at"]
 COOKIE_MAX_AGE_SECONDS = 31536000
 MAX_CLIENT_ID_LENGTH = 120
@@ -1303,7 +1310,7 @@ def _poll_container_ip_sync(vmid: int, timeout: int) -> str:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            cmd_timeout = min(15, max(1, int(remaining)))
+            cmd_timeout = min(_MAX_POLL_CMD_TIMEOUT, max(1, int(remaining)))
             try:
                 c = _get_client()
                 output = _exec_via_client(c, f"pct exec {vmid} -- hostname -I", cmd_timeout)
@@ -1339,7 +1346,7 @@ def _poll_container_ip_sync(vmid: int, timeout: int) -> str:
 async def wait_for_container(vmid: int, timeout: int) -> str:
     # Run the blocking polling loop in a thread with a hard asyncio-level safety
     # timeout so a stalled SSH connection can never block the event loop indefinitely.
-    hard_timeout = timeout + _SSH_CONNECT_TIMEOUT + 5
+    hard_timeout = timeout + _SSH_CONNECT_TIMEOUT + _TIMEOUT_BUFFER_SECONDS
     return await asyncio.wait_for(
         asyncio.to_thread(_poll_container_ip_sync, vmid, timeout),
         timeout=hard_timeout,
@@ -1403,9 +1410,7 @@ def _poll_vm_ip_sync(vmid: int, timeout: int, mac: str | None) -> str:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            cmd_timeout = min(15, max(1, int(remaining)))
-
-            # --- method 1: QEMU guest agent ---
+            cmd_timeout = min(_MAX_POLL_CMD_TIMEOUT, max(1, int(remaining)))
             try:
                 c = _get_client()
                 output = _exec_via_client(
@@ -1436,7 +1441,7 @@ def _poll_vm_ip_sync(vmid: int, timeout: int, mac: str | None) -> str:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                cmd_timeout = min(15, max(1, int(remaining)))
+                cmd_timeout = min(_MAX_POLL_CMD_TIMEOUT, max(1, int(remaining)))
                 try:
                     c = _get_client()
                     neigh = _exec_via_client(
@@ -1488,7 +1493,7 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
     # Fetch the VM's MAC once (outside the polling thread) so the ARP fallback
     # does not need an extra SSH round-trip on every iteration.
     try:
-        mac = await asyncio.wait_for(get_vm_mac(vmid), timeout=20)
+        mac = await asyncio.wait_for(get_vm_mac(vmid), timeout=_MAC_LOOKUP_TIMEOUT)
     except Exception:
         mac = None
     if mac is None:
@@ -1501,7 +1506,7 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
 
     # Run the blocking polling loop in a thread; apply a hard asyncio-level
     # safety timeout so a stalled SSH thread can never block indefinitely.
-    hard_timeout = timeout + _SSH_CONNECT_TIMEOUT + 5
+    hard_timeout = timeout + _SSH_CONNECT_TIMEOUT + _TIMEOUT_BUFFER_SECONDS
     return await asyncio.wait_for(
         asyncio.to_thread(_poll_vm_ip_sync, vmid, timeout, mac),
         timeout=hard_timeout,
