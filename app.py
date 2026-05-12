@@ -220,7 +220,7 @@ def normalize_client_id(value: str | None) -> str | None:
     return cleaned
 
 
-async def apply_network_restrictions(vmid: int, cfg: dict[str, Any], is_vm: bool = False) -> None:
+async def apply_network_restrictions(vmid: int, cfg: dict[str, Any], is_vm: bool) -> None:
     blocklist = [str(item).strip() for item in cfg.get("local_network_blocklist", []) if str(item).strip()]
     allowlist = [str(item).strip() for item in cfg.get("local_network_allowlist", []) if str(item).strip()]
     allow_set = set(allowlist)
@@ -267,7 +267,7 @@ async def apply_network_restrictions(vmid: int, cfg: dict[str, Any], is_vm: bool
 
     script = "\n".join(lines)
     if is_vm:
-        await run_ssh(f"qm guest exec {vmid} -- sh -lc {shlex.quote(script)}", timeout=60)
+        await run_ssh(f"qm guest exec {vmid} sh -lc {shlex.quote(script)}", timeout=60)
     else:
         await run_ssh(f"pct exec {vmid} -- sh -lc {shlex.quote(script)}", timeout=60)
 
@@ -583,10 +583,15 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
 
 
 def open_vm_ssh_client(vm_ip: str, password: str, timeout: int = 30) -> paramiko.SSHClient:
-    """Open a direct paramiko SSH connection to a QEMU VM using root password auth."""
+    """Open a direct paramiko SSH connection to a QEMU VM using root password auth.
+
+    Each session VM is a freshly-cloned ephemeral instance whose host key is unknown
+    in advance and changes every time.  AutoAddPolicy is used intentionally here because
+    the connection is made to a VM on the local Proxmox host network (not the public
+    internet), and strict host-key checking would block every new session.
+    """
     client = paramiko.SSHClient()
-    # VM host keys are ephemeral (fresh clone each session); auto-add is acceptable here.
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # nosec B507 - intentional for ephemeral VMs
     try:
         client.connect(
             hostname=vm_ip,
@@ -607,7 +612,7 @@ def open_vm_ssh_client(vm_ip: str, password: str, timeout: int = 30) -> paramiko
     return client
 
 
-async def start_gui_services(vmid: int, vnc_password: str, is_vm: bool = False) -> None:
+async def start_gui_services(vmid: int, vnc_password: str, is_vm: bool) -> None:
     """Start Xvfb, a desktop environment, and x11vnc inside the container.
 
     The container template must have ``xvfb``, ``x11vnc``, and at least one of
@@ -636,13 +641,13 @@ async def start_gui_services(vmid: int, vnc_password: str, is_vm: bool = False) 
         "nohup x11vnc -display :99 -rfbauth /tmp/.vncpw -forever -rfbport 5900 >/tmp/x11vnc.log 2>&1 &"
     )
     await run_ssh(
-        f"qm guest exec {vmid} -- bash -c {shlex.quote(script)}" if is_vm
+        f"qm guest exec {vmid} bash -c {shlex.quote(script)}" if is_vm
         else f"pct exec {vmid} -- bash -c {shlex.quote(script)}",
         timeout=30,
     )
 
 
-async def wait_for_vnc(vmid: int, timeout: int, is_vm: bool = False) -> None:
+async def wait_for_vnc(vmid: int, timeout: int, is_vm: bool) -> None:
     """Poll until x11vnc is listening on port 5900 inside the container or VM."""
     deadline = time.time() + timeout
     check_cmd = "ss -tlnp 2>/dev/null | grep -q :5900 && echo ok || true"
@@ -650,7 +655,7 @@ async def wait_for_vnc(vmid: int, timeout: int, is_vm: bool = False) -> None:
         try:
             if is_vm:
                 out = await run_ssh(
-                    f"qm guest exec {vmid} -- bash -c {shlex.quote(check_cmd)}",
+                    f"qm guest exec {vmid} bash -c {shlex.quote(check_cmd)}",
                     timeout=10,
                 )
             else:
@@ -776,7 +781,7 @@ async def launch(request: Request):
                 f"{{ printf root:; printf {password_b64} | base64 -d; printf '\\n'; }} | chpasswd"
             )
             await run_ssh(
-                f"qm guest exec {vmid} -- sh -lc {shlex.quote(vm_chpasswd)}",
+                f"qm guest exec {vmid} sh -lc {shlex.quote(vm_chpasswd)}",
                 timeout=60,
             )
             if is_gui and gui_vm_username and gui_vm_password:
@@ -787,7 +792,7 @@ async def launch(request: Request):
                         f"printf {gui_pw_b64} | base64 -d; printf '\\n'; }} | chpasswd"
                     )
                     await run_ssh(
-                        f"qm guest exec {vmid} -- sh -lc {shlex.quote(vm_gui_chpasswd)}",
+                        f"qm guest exec {vmid} sh -lc {shlex.quote(vm_gui_chpasswd)}",
                         timeout=60,
                     )
                 else:
