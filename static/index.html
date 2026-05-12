@@ -19,6 +19,16 @@
     <form id="launch-form">
       <button type="submit">Launch Session</button>
     </form>
+    <section id="startup-progress" hidden aria-live="polite">
+      <div class="progress-header">
+        <span id="startup-phase">Queued</span>
+        <span id="startup-percent">0%</span>
+      </div>
+      <div class="progress-bar" aria-hidden="true">
+        <div id="startup-progress-fill"></div>
+      </div>
+      <div id="startup-message" class="status-detail">Waiting to start your session.</div>
+    </section>
     <div id="status" role="status" aria-live="polite" aria-atomic="true"></div>
   </main>
 
@@ -35,6 +45,7 @@
 
   <!-- GUI mode -->
   <section id="gui-wrap" hidden>
+    <div id="gui-status" role="status" aria-live="polite"></div>
     <div id="vnc-canvas"></div>
     <div id="gui-session-banner">
       <span id="gui-container-name">Container: -</span>

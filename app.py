@@ -15,6 +15,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from typing import Callable
 
 import paramiko
 from cryptography.fernet import Fernet, InvalidToken
@@ -42,6 +43,21 @@ MAX_CLIENT_ID_LENGTH = 120
 # Validation pattern for the GUI OS username: must start with a letter, followed by
 # up to 31 alphanumeric characters or the symbols . _ @ - (max 32 chars total).
 GUI_VM_USERNAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.@-]{0,31}$")
+_STARTUP_TASKS: set[asyncio.Task[Any]] = set()
+
+STARTUP_PHASE_LABELS = {
+    "queued": "Queued",
+    "cloning": "Cloning template",
+    "configuring_network": "Configuring network",
+    "starting": "Starting guest",
+    "waiting_for_ip": "Waiting for IP address",
+    "setting_passwords": "Configuring credentials",
+    "applying_network_restrictions": "Applying network restrictions",
+    "starting_gui_services": "Starting desktop services",
+    "waiting_for_vnc": "Waiting for desktop stream",
+    "ready": "Ready",
+    "failed": "Failed",
+}
 
 
 @asynccontextmanager
@@ -55,8 +71,11 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        startup_tasks = list(_STARTUP_TASKS)
+        for task in startup_tasks:
+            task.cancel()
         cleanup_task.cancel()
-        await asyncio.gather(cleanup_task, return_exceptions=True)
+        await asyncio.gather(cleanup_task, *startup_tasks, return_exceptions=True)
 
 
 app = FastAPI(title="LXChoster", lifespan=lifespan)
@@ -224,6 +243,114 @@ def normalize_client_id(value: str | None) -> str | None:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", cleaned):
         return None
     return cleaned
+
+
+def build_startup_state(
+    phase: str,
+    message: str,
+    percent: int,
+    *,
+    error: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "phase": phase,
+        "label": STARTUP_PHASE_LABELS.get(phase, phase.replace("_", " ").title()),
+        "message": message,
+        "percent": max(0, min(int(percent), 100)),
+        "updated_at": int(time.time()),
+        "error": error,
+    }
+
+
+def build_gui_tunnel_state(state: str, message: str, **extra: Any) -> dict[str, Any]:
+    payload = {"state": state, "message": message, "updated_at": int(time.time())}
+    payload.update(extra)
+    return payload
+
+
+def mutate_session(session_id: str, mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any] | None:
+    with StateLock():
+        state = read_state()
+        session = state.get(session_id)
+        if not isinstance(session, dict):
+            return None
+        mutator(session)
+        session["updated_at"] = int(time.time())
+        state[session_id] = session
+        write_state(state)
+        return dict(session)
+
+
+def set_session_startup(
+    session_id: str,
+    phase: str,
+    message: str,
+    percent: int,
+    *,
+    error: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    return mutate_session(
+        session_id,
+        lambda session: session.__setitem__("startup", build_startup_state(phase, message, percent, error=error)),
+    )
+
+
+def set_gui_tunnel_status(session_id: str, state: str, message: str, **extra: Any) -> dict[str, Any] | None:
+    return mutate_session(
+        session_id,
+        lambda session: session.__setitem__("gui_tunnel", build_gui_tunnel_state(state, message, **extra)),
+    )
+
+
+def serialize_session_payload(
+    session_id: str,
+    session: dict[str, Any],
+    *,
+    reused: bool = False,
+    cfg: dict[str, Any] | None = None,
+    include_gui_secrets: bool = True,
+) -> dict[str, Any]:
+    config = cfg or load_config()
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "vmid": session.get("vmid"),
+        "hostname": session.get("hostname"),
+        "ip": session.get("ip"),
+        "status": session.get("status"),
+        "reused": reused,
+        "ready": session.get("status") == "running" and bool(session.get("ip")),
+        "is_gui": bool(session.get("is_gui", False)),
+        "is_vm": bool(session.get("is_vm", False)),
+        "startup": build_startup_state("queued", "Queued to start your session.", 0),
+    }
+    startup = session.get("startup")
+    if isinstance(startup, dict):
+        payload["startup"] = startup
+    if payload["is_gui"]:
+        payload["gui_vm_username"] = str(config.get("gui_vm_username", "")).strip()
+        payload["gui_vm_password"] = ensure_gui_vm_password() if payload["ready"] and include_gui_secrets else ""
+        payload["gui_vnc_password"] = str(session.get("vnc_password", "")) if payload["ready"] and include_gui_secrets else ""
+    gui_tunnel = session.get("gui_tunnel")
+    if isinstance(gui_tunnel, dict):
+        payload["gui_tunnel"] = gui_tunnel
+    cleanup_reason = session.get("cleanup_reason")
+    if cleanup_reason:
+        payload["cleanup_reason"] = cleanup_reason
+    return payload
+
+
+def schedule_background_task(coro: Any) -> None:
+    task = asyncio.create_task(coro)
+    _STARTUP_TASKS.add(task)
+
+    def _finish(done_task: asyncio.Task[Any]) -> None:
+        _STARTUP_TASKS.discard(done_task)
+        try:
+            done_task.result()
+        except Exception:
+            logger.exception("Background startup task failed unexpectedly")
+
+    task.add_done_callback(_finish)
 
 
 async def apply_network_restrictions(
@@ -535,24 +662,72 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
     return client
 
 
+class RemoteCommandError(RuntimeError):
+    def __init__(
+        self,
+        remote: str,
+        message: str,
+        *,
+        timeout: int | None = None,
+        exit_code: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.remote = remote
+        self.timeout = timeout
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class RemoteCommandTimeout(RemoteCommandError):
+    pass
+
+
 def ssh_cmd(remote: str, timeout: int = 60) -> str:
     logger.debug("SSH cmd (timeout=%ds): %s", timeout, remote)
     client = open_ssh_client(timeout=timeout)
     try:
         _, stdout, stderr = client.exec_command(remote, timeout=timeout)
-        stdout.channel.settimeout(timeout)
-        stderr.channel.settimeout(timeout)
-        try:
-            exit_code = stdout.channel.recv_exit_status()
-            out = stdout.read().decode(errors="replace").strip()
-            err = stderr.read().decode(errors="replace").strip()
-        except socket.timeout as exc:
-            raise RuntimeError(f"Remote command timed out after {timeout} seconds.") from exc
+        channel = stdout.channel
+        channel.settimeout(timeout)
+        chunks_out: list[bytes] = []
+        chunks_err: list[bytes] = []
+        deadline = time.monotonic() + timeout
+        while True:
+            while channel.recv_ready():
+                chunks_out.append(channel.recv(32768))
+            while channel.recv_stderr_ready():
+                chunks_err.append(channel.recv_stderr(32768))
+            if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                break
+            if time.monotonic() >= deadline:
+                partial_out = b"".join(chunks_out).decode(errors="replace").strip()
+                partial_err = b"".join(chunks_err).decode(errors="replace").strip()
+                channel.close()
+                raise RemoteCommandTimeout(
+                    remote,
+                    f"Remote command timed out after {timeout} seconds.",
+                    timeout=timeout,
+                    stdout=partial_out,
+                    stderr=partial_err,
+                )
+            time.sleep(0.1)
+        exit_code = channel.recv_exit_status()
+        out = b"".join(chunks_out).decode(errors="replace").strip()
+        err = b"".join(chunks_err).decode(errors="replace").strip()
     finally:
         client.close()
     if exit_code:
         logger.debug("SSH cmd failed (exit=%d) stderr=%r stdout=%r cmd=%s", exit_code, err, out, remote)
-        raise RuntimeError(err or out or f"remote command failed with exit code {exit_code}")
+        raise RemoteCommandError(
+            remote,
+            err or out or f"remote command failed with exit code {exit_code}",
+            exit_code=exit_code,
+            stdout=out,
+            stderr=err,
+        )
     logger.debug("SSH cmd ok (exit=0) output=%r", out)
     return out
 
@@ -564,6 +739,118 @@ def validate_session_id(session_id: str) -> None:
 
 async def run_ssh(remote: str, timeout: int = 60) -> str:
     return await asyncio.to_thread(ssh_cmd, remote, timeout)
+
+
+async def fetch_proxmox_task_log(vmid: int, since_epoch: float) -> str | None:
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(max(0, since_epoch - 5)))
+    command = (
+        "LOGS=$(journalctl -u pvedaemon "
+        f"--since {shlex.quote(since)} --no-pager -n 200 | grep -F -- {shlex.quote(str(vmid))} | tail -n 40); "
+        'if [ -n "$LOGS" ]; then printf "%s" "$LOGS"; '
+        f"else journalctl -u pvedaemon --since {shlex.quote(since)} --no-pager -n 40; fi"
+    )
+    try:
+        output = await run_ssh(command, timeout=20)
+    except Exception as exc:
+        logger.debug("Failed to fetch Proxmox task log for vmid=%s: %s", vmid, exc)
+        return None
+    return output or None
+
+
+def classify_startup_error(phase: str, exc: Exception) -> tuple[str, str]:
+    if phase == "cloning":
+        return "clone_timeout" if isinstance(exc, RemoteCommandTimeout) else "clone_failed", (
+            "Timed out while cloning the template on the Proxmox host."
+            if isinstance(exc, RemoteCommandTimeout)
+            else "Failed while cloning the template on the Proxmox host."
+        )
+    if phase == "configuring_network":
+        return "network_config_failed", "Failed while configuring guest networking."
+    if phase == "starting":
+        return "start_timeout" if isinstance(exc, RemoteCommandTimeout) else "start_failed", (
+            "Timed out while starting the guest."
+            if isinstance(exc, RemoteCommandTimeout)
+            else "Failed while starting the guest."
+        )
+    if phase == "waiting_for_ip":
+        return "ip_timeout", "Timed out while waiting for the guest to obtain an IP address."
+    if phase == "setting_passwords":
+        return "credentials_failed", "Failed while configuring guest credentials."
+    if phase == "applying_network_restrictions":
+        return "network_restrictions_failed", "Failed while applying network restrictions inside the guest."
+    if phase == "starting_gui_services":
+        return "gui_services_failed", "Failed while starting the desktop and VNC services."
+    if phase == "waiting_for_vnc":
+        return "vnc_timeout", "Timed out while waiting for the desktop stream to become ready."
+    return "startup_failed", "Session startup failed unexpectedly."
+
+
+async def build_startup_error(
+    phase: str,
+    exc: Exception,
+    *,
+    vmid: int,
+    phase_started_at: float,
+) -> dict[str, Any]:
+    code, message = classify_startup_error(phase, exc)
+    error: dict[str, Any] = {
+        "code": code,
+        "message": message,
+        "detail": str(exc),
+    }
+    if phase in {"cloning", "configuring_network", "starting", "waiting_for_ip"}:
+        task_log = await fetch_proxmox_task_log(vmid, phase_started_at)
+        if task_log:
+            error["proxmox_task_log"] = task_log
+    if isinstance(exc, RemoteCommandError):
+        if exc.stderr:
+            error["stderr"] = exc.stderr
+        if exc.stdout:
+            error["stdout"] = exc.stdout
+        if exc.timeout is not None:
+            error["timeout_seconds"] = exc.timeout
+        if exc.exit_code is not None:
+            error["exit_code"] = exc.exit_code
+        error["command"] = exc.remote
+    return error
+
+
+async def run_startup_phase(
+    session_id: str,
+    phase_context: dict[str, Any],
+    phase: str,
+    percent: int,
+    message: str,
+    operation: Callable[[], Any],
+):
+    phase_started_at = time.time()
+    phase_context["phase"] = phase
+    phase_context["percent"] = percent
+    phase_context["message"] = message
+    phase_context["phase_started_at"] = phase_started_at
+    set_session_startup(session_id, phase, message, percent, error=None)
+    started = time.monotonic()
+    logger.info("Session %s startup phase=%s started: %s", session_id, phase, message)
+    try:
+        result = operation()
+        if asyncio.iscoroutine(result):
+            result = await result
+    except Exception:
+        logger.error(
+            "Session %s startup phase=%s failed after %.2fs",
+            session_id,
+            phase,
+            time.monotonic() - started,
+            exc_info=True,
+        )
+        raise
+    logger.info(
+        "Session %s startup phase=%s completed in %.2fs",
+        session_id,
+        phase,
+        time.monotonic() - started,
+    )
+    return result
 
 
 async def allocate_vmid() -> int:
@@ -583,14 +870,15 @@ async def allocate_vmid() -> int:
     return candidate
 
 
-async def cleanup_session(session_id: str, reason: str = "cleanup") -> None:
+async def cleanup_session(session_id: str, reason: str = "cleanup", preserve_status: str | None = None) -> None:
     validate_session_id(session_id)
     with StateLock():
         state = read_state()
         session = state.get(session_id)
         if not session or session.get("status") == "cleaned":
             return
-        session["status"] = "cleaning"
+        original_status = str(session.get("status", ""))
+        session["status"] = "cleaning" if preserve_status is None else original_status
         session["cleanup_reason"] = reason
         session["updated_at"] = int(time.time())
         state[session_id] = session
@@ -602,25 +890,27 @@ async def cleanup_session(session_id: str, reason: str = "cleanup") -> None:
         cleanup_commands = (
             f"qm shutdown {vmid} --timeout 10 || true",
             f"qm stop {vmid} || true",
-            f"qm destroy {vmid} --purge 1",
+            f"qm destroy {vmid} --purge 1 || true",
         )
     else:
         cleanup_commands = (
             f"pct shutdown {vmid} --timeout 10 || true",
             f"pct stop {vmid} || true",
-            f"pct destroy {vmid} --purge 1 --destroy-unreferenced-disks 1",
+            f"pct destroy {vmid} --purge 1 --destroy-unreferenced-disks 1 || true",
         )
     for command in cleanup_commands:
         await run_ssh(command, timeout=120)
 
     with StateLock():
         state = read_state()
-        state[session_id] = {
+        updated_session = {
             **state.get(session_id, session),
-            "status": "cleaned",
+            "status": preserve_status or "cleaned",
             "cleaned_at": int(time.time()),
             "cleanup_reason": reason,
+            "resource_cleanup": "complete",
         }
+        state[session_id] = updated_session
         write_state(state)
         remove_session_history(session_id)
         logger.info(
@@ -628,6 +918,311 @@ async def cleanup_session(session_id: str, reason: str = "cleanup") -> None:
             session_id,
             vmid,
             reason,
+            active_session_count(state),
+        )
+
+
+async def provision_session(session_id: str) -> None:
+    validate_session_id(session_id)
+    cfg = load_config()
+    with StateLock():
+        state = read_state()
+        session = state.get(session_id)
+        if not isinstance(session, dict):
+            return
+        vmid = int(session["vmid"])
+        hostname = str(session["hostname"])
+        issued_client_id = str(session.get("client_id", ""))
+        is_gui = bool(session.get("is_gui", False))
+        is_vm = bool(session.get("is_vm", False))
+        vnc_password = str(session.get("vnc_password", ""))
+
+    gui_vm_username = str(cfg.get("gui_vm_username", "")).strip() if is_gui else ""
+    gui_vm_password = ensure_gui_vm_password() if is_gui else ""
+    password = secrets.token_urlsafe(24)
+    password_b64 = base64.b64encode(password.encode()).decode()
+    vm_chpasswd = f"{{ printf root:; printf {password_b64} | base64 -d; printf '\\n'; }} | chpasswd"
+    phase_context: dict[str, Any] = {
+        "phase": "queued",
+        "percent": 0,
+        "message": "Queued to start your session.",
+        "phase_started_at": time.time(),
+    }
+    set_session_startup(session_id, "queued", "Queued to start your session.", 0, error=None)
+
+    try:
+        if is_vm:
+            vm_boot_timeout = int(cfg["vm_boot_timeout_seconds"])
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "cloning",
+                10,
+                f"Cloning VM template {cfg['template_id']} on the Proxmox host.",
+                lambda: run_ssh(
+                    f"qm clone {int(cfg['template_id'])} {vmid} --name {hostname} --full 1",
+                    timeout=300,
+                ),
+            )
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "configuring_network",
+                25,
+                f"Configuring the VM network on bridge {cfg['bridge']}.",
+                lambda: run_ssh(
+                    f"qm set {vmid} --net0 model=virtio,bridge={cfg['bridge']},firewall=0",
+                    timeout=60,
+                ),
+            )
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "starting",
+                40,
+                "Starting the VM.",
+                lambda: run_ssh(f"qm start {vmid}", timeout=120),
+            )
+            ip = await run_startup_phase(
+                session_id,
+                phase_context,
+                "waiting_for_ip",
+                55,
+                "Waiting for the VM to report a routable IPv4 address.",
+                lambda: wait_for_vm(vmid, vm_boot_timeout),
+            )
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "setting_passwords",
+                65,
+                "Setting session credentials inside the VM.",
+                lambda: run_ssh(f"qm guest exec {vmid} sh -lc {shlex.quote(vm_chpasswd)}", timeout=60),
+            )
+            if is_gui and gui_vm_username and gui_vm_password:
+                if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
+                    gui_pw_b64 = base64.b64encode(gui_vm_password.encode()).decode()
+                    vm_gui_chpasswd = (
+                        f"{{ printf {shlex.quote(gui_vm_username)}:; "
+                        f"printf {gui_pw_b64} | base64 -d; printf '\\n'; }} | chpasswd"
+                    )
+                    await run_startup_phase(
+                        session_id,
+                        phase_context,
+                        "setting_passwords",
+                        68,
+                        f"Setting GUI credentials for {gui_vm_username}.",
+                        lambda: run_ssh(f"qm guest exec {vmid} sh -lc {shlex.quote(vm_gui_chpasswd)}", timeout=60),
+                    )
+                else:
+                    logger.warning(
+                        "gui_vm_username %r contains invalid characters; skipping chpasswd",
+                        gui_vm_username,
+                    )
+            vm_gui_allowlist: list[str] = []
+            if is_gui:
+                vm_gui_allowlist = await run_startup_phase(
+                    session_id,
+                    phase_context,
+                    "applying_network_restrictions",
+                    75,
+                    "Resolving Proxmox return-path allowlist entries for the desktop stream.",
+                    lambda: resolve_gui_vm_allowlist(ip, cfg),
+                )
+                if vm_gui_allowlist:
+                    logger.info(
+                        "Session %s: allowing Proxmox host return traffic for GUI VM %s via %s",
+                        session_id,
+                        vmid,
+                        ", ".join(vm_gui_allowlist),
+                    )
+                else:
+                    logger.warning(
+                        "Session %s: could not resolve proxmox_host=%r to IPv4 for GUI VM %s allowlist",
+                        session_id,
+                        str(cfg.get("proxmox_host", "")).strip(),
+                        vmid,
+                    )
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "applying_network_restrictions",
+                80,
+                "Applying outbound network restrictions inside the VM.",
+                lambda: apply_network_restrictions(vmid, cfg, is_vm=True, extra_allowlist=vm_gui_allowlist),
+            )
+            if is_gui:
+                await run_startup_phase(
+                    session_id,
+                    phase_context,
+                    "starting_gui_services",
+                    88,
+                    "Starting the desktop environment and VNC server.",
+                    lambda: start_gui_services(vmid, vnc_password, is_vm=True),
+                )
+                await run_startup_phase(
+                    session_id,
+                    phase_context,
+                    "waiting_for_vnc",
+                    95,
+                    "Waiting for the desktop stream to accept connections.",
+                    lambda: wait_for_vnc(vmid, vm_boot_timeout, is_vm=True),
+                )
+        else:
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "cloning",
+                10,
+                f"Cloning container template {cfg['template_id']} on the Proxmox host.",
+                lambda: run_ssh(
+                    f"pct clone {int(cfg['template_id'])} {vmid} --hostname {hostname} "
+                    f"--full 1 --storage {cfg['storage']}",
+                    timeout=300,
+                ),
+            )
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "configuring_network",
+                25,
+                f"Configuring the container network on bridge {cfg['bridge']}.",
+                lambda: run_ssh(
+                    f"pct set {vmid} --net0 name=eth0,bridge={cfg['bridge']},ip=dhcp --features nesting=1",
+                    timeout=60,
+                ),
+            )
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "starting",
+                40,
+                "Starting the container.",
+                lambda: run_ssh(f"pct start {vmid}", timeout=120),
+            )
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "setting_passwords",
+                55,
+                "Setting session credentials inside the container.",
+                lambda: run_ssh(
+                    f"pct exec {vmid} -- sh -lc "
+                    f"'{{ printf root:; printf {password_b64} | base64 -d; printf \"\\n\"; }} | chpasswd'",
+                    timeout=60,
+                ),
+            )
+            if is_gui and gui_vm_username and gui_vm_password:
+                if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
+                    gui_pw_b64 = base64.b64encode(gui_vm_password.encode()).decode()
+                    await run_startup_phase(
+                        session_id,
+                        phase_context,
+                        "setting_passwords",
+                        60,
+                        f"Setting GUI credentials for {gui_vm_username}.",
+                        lambda: run_ssh(
+                            f"pct exec {vmid} -- sh -lc "
+                            f"'{{ printf {shlex.quote(gui_vm_username)}:; printf {gui_pw_b64} | base64 -d; "
+                            f"printf \"\\n\"; }} | chpasswd'",
+                            timeout=60,
+                        ),
+                    )
+                else:
+                    logger.warning(
+                        "gui_vm_username %r contains invalid characters; skipping chpasswd",
+                        gui_vm_username,
+                    )
+            await run_startup_phase(
+                session_id,
+                phase_context,
+                "applying_network_restrictions",
+                70,
+                "Applying outbound network restrictions inside the container.",
+                lambda: apply_network_restrictions(vmid, cfg, is_vm=False),
+            )
+            ip = await run_startup_phase(
+                session_id,
+                phase_context,
+                "waiting_for_ip",
+                82,
+                "Waiting for the container to obtain an IPv4 address.",
+                lambda: wait_for_container(vmid, int(cfg["boot_timeout_seconds"])),
+            )
+            if is_gui:
+                await run_startup_phase(
+                    session_id,
+                    phase_context,
+                    "starting_gui_services",
+                    90,
+                    "Starting the desktop environment and VNC server.",
+                    lambda: start_gui_services(vmid, vnc_password, is_vm=False),
+                )
+                await run_startup_phase(
+                    session_id,
+                    phase_context,
+                    "waiting_for_vnc",
+                    96,
+                    "Waiting for the desktop stream to accept connections.",
+                    lambda: wait_for_vnc(vmid, int(cfg["boot_timeout_seconds"]), is_vm=False),
+                )
+    except Exception as exc:
+        error = await build_startup_error(
+            str(phase_context.get("phase", "failed")),
+            exc,
+            vmid=vmid,
+            phase_started_at=float(phase_context.get("phase_started_at", time.time())),
+        )
+        set_session_startup(session_id, "failed", error["message"], int(phase_context.get("percent", 0)), error=error)
+        failed_session = mutate_session(
+            session_id,
+            lambda current: current.update(
+                {
+                    "status": "failed",
+                    "last_seen": int(time.time()),
+                }
+            ),
+        )
+        if failed_session and issued_client_id:
+            upsert_session_history(issued_client_id, session_id, failed_session, int(time.time()))
+        logger.error("Session %s creation failed: %s", session_id, error["detail"], exc_info=True)
+        try:
+            await cleanup_session(session_id, f"create_failed: {error['code']}", preserve_status="failed")
+        except Exception as cleanup_exc:
+            logger.error("Session %s cleanup after startup failure also failed: %s", session_id, cleanup_exc, exc_info=True)
+            mutate_session(
+                session_id,
+                lambda current: current.setdefault("startup", {}).setdefault("error", {}).__setitem__(
+                    "cleanup_error", str(cleanup_exc)
+                ),
+            )
+        return
+
+    with StateLock():
+        state = read_state()
+        if session_id not in state:
+            return
+        update = {
+            "status": "running",
+            "ip": ip,
+            "last_seen": int(time.time()),
+            "startup": build_startup_state("ready", "Session is ready. Connecting your browser now.", 100),
+        }
+        if is_vm:
+            update["vm_root_password"] = password
+        if is_gui:
+            update["gui_tunnel"] = build_gui_tunnel_state("idle", "Desktop is ready. Connect to start streaming.")
+        state[session_id].update(update)
+        write_state(state)
+        if issued_client_id:
+            upsert_session_history(issued_client_id, session_id, state[session_id], int(time.time()))
+        logger.info(
+            "Session created id=%s vmid=%s hostname=%s is_gui=%s is_vm=%s active_sessions=%d",
+            session_id,
+            vmid,
+            hostname,
+            is_gui,
+            is_vm,
             active_session_count(state),
         )
 
@@ -849,9 +1444,6 @@ async def launch(request: Request):
     cfg = load_config()
     is_gui = bool(cfg.get("is_gui", False))
     is_vm = bool(cfg.get("is_vm", False))
-    gui_vm_username = str(cfg.get("gui_vm_username", "")).strip() if is_gui else ""
-    gui_vm_password = ensure_gui_vm_password() if is_gui else ""
-    password = secrets.token_urlsafe(24)
     # Per-session VNC password (8 hex chars) used for defense-in-depth VNC auth.
     vnc_password = secrets.token_hex(4) if is_gui else ""
     now = int(time.time())
@@ -868,7 +1460,7 @@ async def launch(request: Request):
             remembered_session = state.get(remembered_session_id)
             if (
                 remembered_session
-                and remembered_session.get("status") == "running"
+                and remembered_session.get("status") in {"creating", "running"}
                 and remembered_session.get("client_id") == presented_client_id
                 and int(remembered_session.get("last_seen", 0)) >= (now - session_ttl)
             ):
@@ -877,19 +1469,13 @@ async def launch(request: Request):
                 state[remembered_session_id] = remembered_session
                 write_state(state)
                 upsert_session_history(issued_client_id, remembered_session_id, remembered_session, now)
-                payload: dict[str, Any] = {
-                    "session_id": remembered_session_id,
-                    "vmid": remembered_session["vmid"],
-                    "hostname": remembered_session["hostname"],
-                    "ip": remembered_session["ip"],
-                    "reused": True,
-                    "is_gui": is_gui,
-                }
-                if is_gui:
-                    payload["gui_vm_username"] = gui_vm_username
-                    payload["gui_vm_password"] = gui_vm_password
-                    payload["gui_vnc_password"] = str(remembered_session.get("vnc_password", ""))
-                response = JSONResponse(payload)
+                payload = serialize_session_payload(
+                    remembered_session_id,
+                    remembered_session,
+                    reused=True,
+                    cfg=cfg,
+                )
+                response = JSONResponse(payload, status_code=200 if payload["ready"] else 202)
                 attach_client_cookie(response, request, issued_client_id)
                 return response
             history_rows = [
@@ -917,146 +1503,32 @@ async def launch(request: Request):
             "is_gui": is_gui,
             "is_vm": is_vm,
             "vnc_password": vnc_password,
+            "startup": build_startup_state("queued", "Queued to start your session.", 0),
         }
         write_state(state)
         upsert_session_history(issued_client_id, session_id, state[session_id], now)
-
-    try:
-        password_b64 = base64.b64encode(password.encode()).decode()
-        if is_vm:
-            vm_boot_timeout = int(cfg["vm_boot_timeout_seconds"])
-            logger.info("Session %s: cloning VM template %s -> vmid %s", session_id, cfg['template_id'], vmid)
-            await run_ssh(
-                f"qm clone {int(cfg['template_id'])} {vmid} --name {hostname} --full 1",
-                timeout=300,
-            )
-            logger.info("Session %s: configuring network for vmid %s", session_id, vmid)
-            await run_ssh(
-                f"qm set {vmid} --net0 model=virtio,bridge={cfg['bridge']},firewall=0",
-                timeout=60,
-            )
-            logger.info("Session %s: starting vmid %s", session_id, vmid)
-            await run_ssh(f"qm start {vmid}", timeout=120)
-            ip = await wait_for_vm(vmid, vm_boot_timeout)
-            logger.info("Session %s: setting root password on vmid %s", session_id, vmid)
-            vm_chpasswd = (
-                f"{{ printf root:; printf {password_b64} | base64 -d; printf '\\n'; }} | chpasswd"
-            )
-            await run_ssh(
-                f"qm guest exec {vmid} sh -lc {shlex.quote(vm_chpasswd)}",
-                timeout=60,
-            )
-            if is_gui and gui_vm_username and gui_vm_password:
-                if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
-                    gui_pw_b64 = base64.b64encode(gui_vm_password.encode()).decode()
-                    vm_gui_chpasswd = (
-                        f"{{ printf {shlex.quote(gui_vm_username)}:; "
-                        f"printf {gui_pw_b64} | base64 -d; printf '\\n'; }} | chpasswd"
-                    )
-                    await run_ssh(
-                        f"qm guest exec {vmid} sh -lc {shlex.quote(vm_gui_chpasswd)}",
-                        timeout=60,
-                    )
-                else:
-                    logger.warning(
-                        "gui_vm_username %r contains invalid characters; skipping chpasswd",
-                        gui_vm_username,
-                    )
-            vm_gui_allowlist: list[str] = []
-            if is_gui:
-                proxmox_host = str(cfg.get("proxmox_host", "")).strip()
-                vm_gui_allowlist = await resolve_gui_vm_allowlist(ip, cfg)
-                if vm_gui_allowlist:
-                    logger.info(
-                        "Session %s: allowing Proxmox host return traffic for GUI VM %s via %s",
-                        session_id,
-                        vmid,
-                        ", ".join(vm_gui_allowlist),
-                    )
-                else:
-                    logger.warning(
-                        "Session %s: could not resolve proxmox_host=%r to IPv4 for GUI VM %s allowlist",
-                        session_id,
-                        proxmox_host,
-                        vmid,
-                    )
-            logger.info("Session %s: applying network restrictions to vmid %s", session_id, vmid)
-            await apply_network_restrictions(vmid, cfg, is_vm=True, extra_allowlist=vm_gui_allowlist)
-            if is_gui:
-                logger.info("Session %s: starting GUI services on vmid %s", session_id, vmid)
-                await start_gui_services(vmid, vnc_password, is_vm=True)
-                await wait_for_vnc(vmid, vm_boot_timeout, is_vm=True)
-        else:
-            logger.info("Session %s: cloning LXC template %s -> vmid %s", session_id, cfg['template_id'], vmid)
-            await run_ssh(
-                f"pct clone {int(cfg['template_id'])} {vmid} --hostname {hostname} "
-                f"--full 1 --storage {cfg['storage']}",
-                timeout=300,
-            )
-            logger.info("Session %s: configuring network for vmid %s", session_id, vmid)
-            await run_ssh(
-                f"pct set {vmid} --net0 name=eth0,bridge={cfg['bridge']},ip=dhcp --features nesting=1",
-                timeout=60,
-            )
-            logger.info("Session %s: starting vmid %s", session_id, vmid)
-            await run_ssh(f"pct start {vmid}", timeout=120)
-            logger.info("Session %s: setting root password on vmid %s", session_id, vmid)
-            await run_ssh(
-                f"pct exec {vmid} -- sh -lc "
-                f"'{{ printf root:; printf {password_b64} | base64 -d; printf \"\\n\"; }} | chpasswd'",
-                timeout=60,
-            )
-            if is_gui and gui_vm_username and gui_vm_password:
-                if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
-                    gui_pw_b64 = base64.b64encode(gui_vm_password.encode()).decode()
-                    await run_ssh(
-                        f"pct exec {vmid} -- sh -lc "
-                        f"'{{ printf {shlex.quote(gui_vm_username)}:; printf {gui_pw_b64} | base64 -d; "
-                        f"printf \"\\n\"; }} | chpasswd'",
-                        timeout=60,
-                    )
-                else:
-                    logger.warning(
-                        "gui_vm_username %r contains invalid characters; skipping chpasswd",
-                        gui_vm_username,
-                    )
-            logger.info("Session %s: applying network restrictions to vmid %s", session_id, vmid)
-            await apply_network_restrictions(vmid, cfg, is_vm=False)
-            ip = await wait_for_container(vmid, int(cfg["boot_timeout_seconds"]))
-            if is_gui:
-                logger.info("Session %s: starting GUI services on vmid %s", session_id, vmid)
-                await start_gui_services(vmid, vnc_password, is_vm=False)
-                await wait_for_vnc(vmid, int(cfg["boot_timeout_seconds"]), is_vm=False)
-    except Exception as exc:
-        logger.error("Session %s creation failed: %s", session_id, exc, exc_info=True)
-        await cleanup_session(session_id, f"create_failed: {exc}")
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    with StateLock():
-        state = read_state()
-        update = {"status": "running", "ip": ip, "last_seen": int(time.time())}
-        if is_vm:
-            update["vm_root_password"] = password
-        state[session_id].update(update)
-        write_state(state)
-        upsert_session_history(issued_client_id, session_id, state[session_id], int(time.time()))
-        logger.info(
-            "Session created id=%s vmid=%s hostname=%s is_gui=%s is_vm=%s active_sessions=%d",
-            session_id,
-            vmid,
-            hostname,
-            is_gui,
-            is_vm,
-            active_session_count(state),
-        )
-    payload = {"session_id": session_id, "vmid": vmid, "hostname": hostname, "ip": ip, "reused": False, "is_gui": is_gui}
-    if is_gui:
-        payload["gui_vm_username"] = gui_vm_username
-        payload["gui_vm_password"] = gui_vm_password
-        payload["gui_vnc_password"] = vnc_password
-    response = JSONResponse(payload)
+    schedule_background_task(provision_session(session_id))
+    response = JSONResponse(serialize_session_payload(session_id, state[session_id], reused=False, cfg=cfg), status_code=202)
     attach_client_cookie(response, request, issued_client_id)
     return response
+
+
+@app.get("/api/session/{session_id}")
+async def session_status(session_id: str, request: Request):
+    validate_session_id(session_id)
+    with StateLock():
+        state = read_state()
+        session = state.get(session_id)
+        if not isinstance(session, dict):
+            raise HTTPException(status_code=404, detail="Session not found.")
+    presented_client_id = normalize_client_id(request.cookies.get(CLIENT_COOKIE_NAME))
+    return JSONResponse(
+        serialize_session_payload(
+            session_id,
+            session,
+            include_gui_secrets=presented_client_id == str(session.get("client_id", "")),
+        )
+    )
 
 
 @app.websocket("/ws/{session_id}")
@@ -1209,6 +1681,13 @@ async def gui_session(websocket: WebSocket, session_id: str):
     vnc_target = (container_ip, 5900)
     disconnect_side: str | None = None
     disconnect_reason: str | None = None
+    set_gui_tunnel_status(
+        session_id,
+        "connecting",
+        "Opening browser tunnel to the desktop stream.",
+        target_ip=container_ip,
+        target_port=5900,
+    )
 
     def record_first_disconnect(side: str, reason: str) -> None:
         """Record the first disconnect source ('ssh' or 'websocket') and reason only once."""
@@ -1217,10 +1696,26 @@ async def gui_session(websocket: WebSocket, session_id: str):
             disconnect_side = side
             disconnect_reason = reason
 
-    client = await asyncio.to_thread(open_ssh_client, 10)
+    try:
+        client = await asyncio.to_thread(open_ssh_client, 10)
+    except Exception as exc:
+        logger.error("Failed to open SSH client for gui session_id=%s: %s", session_id, exc)
+        set_gui_tunnel_status(
+            session_id,
+            "error",
+            "Failed to open the SSH tunnel to the Proxmox host.",
+            detail=str(exc),
+        )
+        await websocket.close(code=1011)
+        return
     transport = client.get_transport()
     if transport is None:
         logger.error("Failed to open SSH transport for gui session_id=%s", session_id)
+        set_gui_tunnel_status(
+            session_id,
+            "error",
+            "Failed to open the SSH transport to the Proxmox host.",
+        )
         client.close()
         await websocket.close(code=1011)
         return
@@ -1245,6 +1740,13 @@ async def gui_session(websocket: WebSocket, session_id: str):
             vnc_target[0],
             vnc_target[1],
         )
+        set_gui_tunnel_status(
+            session_id,
+            "connected",
+            "Browser tunnel connected to the desktop stream.",
+            target_ip=vnc_target[0],
+            target_port=vnc_target[1],
+        )
     except Exception as exc:
         logger.error(
             "Failed to open VNC channel for session %s target=%s:%d: %s",
@@ -1252,6 +1754,14 @@ async def gui_session(websocket: WebSocket, session_id: str):
             vnc_target[0],
             vnc_target[1],
             exc,
+        )
+        set_gui_tunnel_status(
+            session_id,
+            "error",
+            "Failed to open the VNC tunnel to the desktop stream.",
+            detail=str(exc),
+            target_ip=vnc_target[0],
+            target_port=vnc_target[1],
         )
         client.close()
         await websocket.close(code=1011)
@@ -1350,6 +1860,15 @@ async def gui_session(websocket: WebSocket, session_id: str):
             channel.closed,
             websocket.application_state,
             websocket.client_state,
+        )
+        set_gui_tunnel_status(
+            session_id,
+            "disconnected" if disconnect_reason else "idle",
+            "Desktop stream disconnected." if disconnect_reason else "Desktop is ready. Connect to start streaming.",
+            disconnect_side=disconnect_side,
+            disconnect_reason=disconnect_reason,
+            target_ip=vnc_target[0],
+            target_port=vnc_target[1],
         )
         channel.close()
         client.close()

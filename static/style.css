@@ -85,6 +85,43 @@ button:disabled {
   font-size: 14px;
 }
 
+#startup-progress {
+  margin-top: 18px;
+  display: grid;
+  gap: 10px;
+}
+
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  color: #c9f5d6;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #102016;
+  border: 1px solid #1b4d2a;
+}
+
+#startup-progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #1d8f45, #64ff95);
+  transition: width .25s ease;
+}
+
+.status-detail {
+  color: #9ee8b6;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 #terminal-wrap {
   width: min(1100px, 100%);
   height: min(70vh, 760px);
@@ -347,6 +384,15 @@ button:disabled {
   border: 1px solid #183b22;
   border-radius: 10px;
   box-shadow: 0 20px 80px rgba(0, 0, 0, .45);
+}
+
+#gui-status {
+  padding: 10px 14px;
+  border-bottom: 1px solid #183b22;
+  background: #091610;
+  color: #b7f5cb;
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 #vnc-canvas {

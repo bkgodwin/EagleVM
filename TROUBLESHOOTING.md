@@ -4,6 +4,7 @@
 
 | What you see in the log | Likely cause |
 |---|---|
+| `startup phase=cloning/configuring_network/... started` with no matching `completed` line | The session is stalled in that exact backend phase; compare the elapsed time and any captured Proxmox task-log excerpt |
 | Repeated `SSH Connected … Authentication successful` every ~2 seconds for 90 s, then nothing | Container/VM boots but never gets an IP – `wait_for_container` or `wait_for_vm` polling loop timed out |
 | `Session XXX creation failed: container … did not boot with an IPv4 address` | LXC container started but DHCP is not assigning an address |
 | `Session XXX creation failed: VM … did not boot with a routable IPv4 address` | QEMU VM started but guest agent unreachable *and* MAC not visible in `ip neigh` |
@@ -41,15 +42,21 @@ With `DEBUG` logging you will see lines like:
 DEBUG SSH cmd (timeout=15s): pct exec 8001 -- hostname -I
 DEBUG Container 8001 poll #1: hostname -I returned empty (no IP yet)
 DEBUG Container 8001 poll #2 error: remote command failed with exit code 1
+INFO Session abc123 startup phase=cloning started: Cloning VM template 9001 on the Proxmox host.
+INFO Session abc123 startup phase=cloning completed in 14.27s
 ```
 
 This immediately tells you *which step* is failing and *why*.
+
+The web UI now mirrors these phases with a progress bar, and `GET /api/session/<session_id>` returns the
+current `startup.phase`, `startup.message`, `startup.percent`, and any structured `startup.error` details.
 
 ---
 
 ## VM GUI blank display / immediate disconnect
 
-If VM session creation succeeds but GUI streaming fails, collect the new GUI tunnel logs:
+If VM session creation succeeds but GUI streaming fails, collect the new GUI tunnel logs and the GUI tunnel
+status returned by `GET /api/session/<session_id>`:
 
 - `GUI tunnel setup session_id=... target=<vm_ip>:5900 ...`
 - `GUI tunnel channel opened session_id=...`
@@ -61,6 +68,8 @@ Interpretation:
 - `Failed to open VNC channel ...` means tunnel setup failed before display traffic started.
 - `first_disconnect_side=ssh` usually means the VM-side VNC channel closed first (check x11vnc inside VM).
 - `first_disconnect_side=websocket` usually means browser/socket side closed first.
+- `gui_tunnel.state=error/disconnected` in the status API gives the last user-facing tunnel failure message
+  shown in the browser so blank-screen reports can be tied back to the backend logs.
 
 In VM GUI mode, ensure the VM can send return traffic back to the Proxmox host. If you block
 `192.168.0.0/16` (or similar) in OUTPUT rules, add an allow entry for the Proxmox host IP first.

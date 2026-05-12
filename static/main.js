@@ -9,9 +9,15 @@ const helpButton = document.getElementById("help-button");
 const helpModal = document.getElementById("help-modal");
 const helpClose = document.getElementById("help-close");
 const helpHeaderClose = document.getElementById("help-header-close");
+const startupProgress = document.getElementById("startup-progress");
+const startupPhase = document.getElementById("startup-phase");
+const startupPercent = document.getElementById("startup-percent");
+const startupFill = document.getElementById("startup-progress-fill");
+const startupMessage = document.getElementById("startup-message");
 
 // GUI mode elements
 const guiWrap = document.getElementById("gui-wrap");
+const guiStatus = document.getElementById("gui-status");
 const vncCanvas = document.getElementById("vnc-canvas");
 const guiContainerName = document.getElementById("gui-container-name");
 const guiContainerIp = document.getElementById("gui-container-ip");
@@ -22,9 +28,75 @@ const credsUsername = document.getElementById("creds-username");
 const credsPassword = document.getElementById("creds-password");
 const credsConnectBtn = document.getElementById("creds-connect-btn");
 
+let pollTimer = null;
+
+function stopPolling() {
+  if (pollTimer !== null) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+}
+
 function closeHelp() {
   helpModal.hidden = true;
   helpButton.focus();
+}
+
+function setGuiStatus(message) {
+  guiStatus.textContent = message;
+  guiStatus.hidden = !message;
+}
+
+function renderStartup(startup) {
+  const phaseLabel = startup?.label || startup?.phase || "Starting session";
+  const percent = Number.isFinite(startup?.percent) ? Math.max(0, Math.min(100, startup.percent)) : 0;
+  startupProgress.hidden = false;
+  startupPhase.textContent = phaseLabel;
+  startupPercent.textContent = `${percent}%`;
+  startupFill.style.width = `${percent}%`;
+  startupMessage.textContent = startup?.error?.message || startup?.message || "Starting your session.";
+}
+
+async function fetchSessionStatus(sessionId) {
+  const response = await fetch(`/api/session/${sessionId}`);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.detail || "Unable to retrieve session status.");
+  return data;
+}
+
+function showLaunchError(message) {
+  statusEl.textContent = message;
+  form.querySelector("button").disabled = false;
+}
+
+function beginSession(session) {
+  stopPolling();
+  renderStartup(session.startup || {label: "Ready", percent: 100, message: "Session is ready."});
+  statusEl.textContent = "";
+  if (session.is_gui) {
+    showCredentialsModal(session, () => openGUI(session));
+  } else {
+    openTerminal(session);
+  }
+}
+
+async function pollUntilReady(sessionId) {
+  try {
+    const session = await fetchSessionStatus(sessionId);
+    renderStartup(session.startup);
+    if (session.status === "failed") {
+      const error = session.startup?.error?.message || session.startup?.error?.detail || "Session startup failed.";
+      showLaunchError(error);
+      return;
+    }
+    if (session.ready) {
+      beginSession(session);
+      return;
+    }
+  } catch (error) {
+    statusEl.textContent = `Waiting for session status... ${error.message}`;
+  }
+  pollTimer = window.setTimeout(() => pollUntilReady(sessionId), 1000);
 }
 
 helpButton.addEventListener("click", () => {
@@ -45,9 +117,11 @@ window.addEventListener("keydown", (event) => {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  stopPolling();
   const button = form.querySelector("button");
   button.disabled = true;
-  statusEl.textContent = "Creating session...";
+  statusEl.textContent = "";
+  renderStartup({label: "Queued", percent: 0, message: "Requesting a new session."});
 
   try {
     const response = await fetch("/api/session", {
@@ -56,14 +130,14 @@ form.addEventListener("submit", async (event) => {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "Unable to launch session.");
-    if (data.is_gui) {
-      showCredentialsModal(data, () => openGUI(data));
-    } else {
-      openTerminal(data);
+    renderStartup(data.startup);
+    if (data.ready) {
+      beginSession(data);
+      return;
     }
+    pollUntilReady(data.session_id);
   } catch (error) {
-    statusEl.textContent = error.message;
-    button.disabled = false;
+    showLaunchError(error.message);
   }
 });
 
@@ -82,6 +156,20 @@ function showCredentialsModal(session, onConnect) {
   credsConnectBtn.addEventListener("click", handleConnect);
 }
 
+async function describeGuiDisconnect(sessionId, fallback) {
+  try {
+    const session = await fetchSessionStatus(sessionId);
+    const tunnel = session.gui_tunnel;
+    if (tunnel?.message) {
+      const suffix = tunnel.disconnect_reason ? ` (${tunnel.disconnect_reason})` : "";
+      return `${tunnel.message}${suffix}`;
+    }
+  } catch {
+    // Ignore follow-up fetch errors and use fallback text.
+  }
+  return fallback;
+}
+
 async function openGUI(session) {
   launch.hidden = true;
   guiWrap.hidden = false;
@@ -94,13 +182,14 @@ async function openGUI(session) {
   if (session.gui_vm_password) {
     guiPasswordDisplay.textContent = `Pass: ${session.gui_vm_password}`;
   }
+  setGuiStatus("Connecting browser to the desktop stream...");
 
   let RFB;
   try {
     const mod = await import("https://cdn.jsdelivr.net/npm/@novnc/novnc@1.4.0/core/rfb.js");
     RFB = mod.default;
   } catch (err) {
-    guiContainerName.textContent = `Failed to load VNC client: ${err.message}`;
+    setGuiStatus(`Failed to load VNC client: ${err.message}`);
     return;
   }
 
@@ -119,12 +208,15 @@ async function openGUI(session) {
 
   rfb.addEventListener("connect", () => {
     guiContainerName.textContent = `Container: ${session.hostname}`;
+    setGuiStatus("Desktop stream connected.");
   });
 
-  rfb.addEventListener("disconnect", (e) => {
+  rfb.addEventListener("disconnect", async (e) => {
     const detail = e.detail || {};
-    const reason = detail.clean ? "Session disconnected." : "Session disconnected unexpectedly.";
-    guiContainerName.textContent = reason + " Reload the page to reconnect within the session window.";
+    const fallback = detail.clean
+      ? "Desktop stream disconnected. Reload the page to reconnect within the session window."
+      : "Desktop stream disconnected unexpectedly. Reload the page to reconnect within the session window.";
+    setGuiStatus(await describeGuiDisconnect(session.session_id, fallback));
   });
 }
 
@@ -196,7 +288,7 @@ function openTerminal(session) {
   });
   socket.addEventListener("close", () => {
     cleanup();
-    terminal.writeln("\\r\\nSession disconnected. Reopen or relaunch within the reconnect window to resume.");
+    terminal.writeln("\r\nSession disconnected. Reopen or relaunch within the reconnect window to resume.");
   });
 
   terminal.onData((data) => {
@@ -205,7 +297,6 @@ function openTerminal(session) {
     }
   });
   const observer = new ResizeObserver(scheduleResize);
-  // Observe the stable wrapper so fit() does not retrigger the observer on xterm's own DOM updates.
   observer.observe(wrap);
   window.addEventListener("resize", scheduleResize);
   window.addEventListener("beforeunload", closeSocket);
