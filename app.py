@@ -307,14 +307,17 @@ def resolve_host_ipv4_addrs(host: str) -> list[str]:
 
 
 async def resolve_route_source_ipv4(destination: str) -> str | None:
-    """Return the Proxmox host IPv4 source address used to reach ``destination``."""
+    """Return the Proxmox host IPv4 source address used to reach ``destination``, or None.
+
+    This runs ``ip -4 route get`` on the Proxmox host over SSH with a 15-second timeout.
+    """
     try:
         destination_ip = str(ipaddress.IPv4Address(destination))
     except ipaddress.AddressValueError:
         logger.warning("Could not resolve route source IP for invalid destination %r", destination)
         return None
     try:
-        output = await run_ssh(f"ip -4 route get {destination_ip}", timeout=15)
+        output = await run_ssh(shlex.join(["ip", "-4", "route", "get", destination_ip]), timeout=15)
     except Exception as exc:
         logger.warning("Could not resolve route source IP for %s: %s", destination_ip, exc)
         return None
