@@ -78,6 +78,7 @@ def load_config() -> dict[str, Any]:
     cfg.setdefault("max_sessions", 25)
     cfg.setdefault("session_ttl_seconds", 600)
     cfg.setdefault("boot_timeout_seconds", 90)
+    cfg.setdefault("vm_boot_timeout_seconds", 180)
     cfg.setdefault("is_gui", False)
     cfg.setdefault("is_vm", False)
     cfg.setdefault("template_id_start", 8000)
@@ -767,6 +768,7 @@ async def launch(request: Request):
     try:
         password_b64 = base64.b64encode(password.encode()).decode()
         if is_vm:
+            vm_boot_timeout = int(cfg["vm_boot_timeout_seconds"])
             await run_ssh(
                 f"qm clone {int(cfg['template_id'])} {vmid} --name {hostname} --full 1",
                 timeout=300,
@@ -776,7 +778,7 @@ async def launch(request: Request):
                 timeout=60,
             )
             await run_ssh(f"qm start {vmid}", timeout=120)
-            ip = await wait_for_vm(vmid, int(cfg["boot_timeout_seconds"]))
+            ip = await wait_for_vm(vmid, vm_boot_timeout)
             vm_chpasswd = (
                 f"{{ printf root:; printf {password_b64} | base64 -d; printf '\\n'; }} | chpasswd"
             )
@@ -803,7 +805,7 @@ async def launch(request: Request):
             await apply_network_restrictions(vmid, cfg, is_vm=True)
             if is_gui:
                 await start_gui_services(vmid, vnc_password, is_vm=True)
-                await wait_for_vnc(vmid, int(cfg["boot_timeout_seconds"]), is_vm=True)
+                await wait_for_vnc(vmid, vm_boot_timeout, is_vm=True)
         else:
             await run_ssh(
                 f"pct clone {int(cfg['template_id'])} {vmid} --hostname {hostname} "

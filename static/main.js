@@ -124,7 +124,7 @@ async function openGUI(session) {
   rfb.addEventListener("disconnect", (e) => {
     const detail = e.detail || {};
     const reason = detail.clean ? "Session disconnected." : "Session disconnected unexpectedly.";
-    guiContainerName.textContent = reason + " Relaunch to start a new session.";
+    guiContainerName.textContent = reason + " Reload the page to reconnect within the session window.";
   });
 }
 

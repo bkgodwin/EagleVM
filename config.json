@@ -24,5 +24,6 @@
   "ssh_user": "root",
   "storage": "local-lvm",
   "template_id": 9000,
-  "template_id_start": 8000
+  "template_id_start": 8000,
+  "vm_boot_timeout_seconds": 180
 }
