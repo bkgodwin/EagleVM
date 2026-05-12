@@ -890,16 +890,21 @@ async def cleanup_session(session_id: str, reason: str = "cleanup", preserve_sta
         cleanup_commands = (
             f"qm shutdown {vmid} --timeout 10 || true",
             f"qm stop {vmid} || true",
-            f"qm destroy {vmid} --purge 1 || true",
+            f"qm destroy {vmid} --purge 1",
         )
     else:
         cleanup_commands = (
             f"pct shutdown {vmid} --timeout 10 || true",
             f"pct stop {vmid} || true",
-            f"pct destroy {vmid} --purge 1 --destroy-unreferenced-disks 1 || true",
+            f"pct destroy {vmid} --purge 1 --destroy-unreferenced-disks 1",
         )
+    cleanup_errors: list[str] = []
     for command in cleanup_commands:
-        await run_ssh(command, timeout=120)
+        try:
+            await run_ssh(command, timeout=120)
+        except Exception as exc:
+            cleanup_errors.append(f"{command}: {exc}")
+            logger.warning("Cleanup command failed for session %s vmid=%s: %s", session_id, vmid, exc)
 
     with StateLock():
         state = read_state()
@@ -910,6 +915,8 @@ async def cleanup_session(session_id: str, reason: str = "cleanup", preserve_sta
             "cleanup_reason": reason,
             "resource_cleanup": "complete",
         }
+        if cleanup_errors:
+            updated_session["cleanup_errors"] = cleanup_errors
         state[session_id] = updated_session
         write_state(state)
         remove_session_history(session_id)

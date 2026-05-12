@@ -27,6 +27,7 @@ const credentialsModal = document.getElementById("credentials-modal");
 const credsUsername = document.getElementById("creds-username");
 const credsPassword = document.getElementById("creds-password");
 const credsConnectBtn = document.getElementById("creds-connect-btn");
+const POLL_INTERVAL_MS = 1000;
 
 let pollTimer = null;
 
@@ -96,7 +97,7 @@ async function pollUntilReady(sessionId) {
   } catch (error) {
     statusEl.textContent = `Waiting for session status... ${error.message}`;
   }
-  pollTimer = window.setTimeout(() => pollUntilReady(sessionId), 1000);
+  pollTimer = window.setTimeout(() => pollUntilReady(sessionId), POLL_INTERVAL_MS);
 }
 
 helpButton.addEventListener("click", () => {
@@ -297,6 +298,7 @@ function openTerminal(session) {
     }
   });
   const observer = new ResizeObserver(scheduleResize);
+  // Observe the stable wrapper so fit() does not retrigger the observer on xterm's own DOM updates.
   observer.observe(wrap);
   window.addEventListener("resize", scheduleResize);
   window.addEventListener("beforeunload", closeSocket);
