@@ -456,7 +456,7 @@ async def apply_network_restrictions(
 
     script = "\n".join(lines)
     if is_vm:
-        await run_ssh(f"qm guest exec {vmid} sh -lc {shlex.quote(script)}", timeout=60)
+        await run_ssh(f"qm guest exec {vmid} -- sh -lc {shlex.quote(script)}", timeout=60)
     else:
         await run_ssh(f"pct exec {vmid} -- sh -lc {shlex.quote(script)}", timeout=60)
 
@@ -1049,7 +1049,7 @@ async def provision_session(session_id: str) -> None:
                 "setting_passwords",
                 65,
                 "Setting session credentials inside the VM.",
-                lambda: run_ssh(f"qm guest exec {vmid} sh -lc {shlex.quote(vm_chpasswd)}", timeout=60),
+                lambda: run_ssh(f"qm guest exec {vmid} -- sh -lc {shlex.quote(vm_chpasswd)}", timeout=60),
             )
             if is_gui and gui_vm_username and gui_vm_password:
                 if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
@@ -1064,7 +1064,7 @@ async def provision_session(session_id: str) -> None:
                         "setting_passwords",
                         68,
                         f"Setting GUI credentials for {gui_vm_username}.",
-                        lambda: run_ssh(f"qm guest exec {vmid} sh -lc {shlex.quote(vm_gui_chpasswd)}", timeout=60),
+                        lambda: run_ssh(f"qm guest exec {vmid} -- sh -lc {shlex.quote(vm_gui_chpasswd)}", timeout=60),
                     )
                 else:
                     logger.warning(
@@ -1572,7 +1572,7 @@ async def start_gui_services(vmid: int, vnc_password: str, is_vm: bool) -> None:
         "nohup x11vnc -display :99 -rfbauth /tmp/.vncpw -forever -rfbport 5900 >/tmp/x11vnc.log 2>&1 &"
     )
     await run_ssh(
-        f"qm guest exec {vmid} bash -c {shlex.quote(script)}" if is_vm
+        f"qm guest exec {vmid} -- bash -c {shlex.quote(script)}" if is_vm
         else f"pct exec {vmid} -- bash -c {shlex.quote(script)}",
         timeout=30,
     )
@@ -1586,7 +1586,7 @@ async def wait_for_vnc(vmid: int, timeout: int, is_vm: bool) -> None:
         try:
             if is_vm:
                 out = await run_ssh(
-                    f"qm guest exec {vmid} bash -c {shlex.quote(check_cmd)}",
+                    f"qm guest exec {vmid} -- bash -c {shlex.quote(check_cmd)}",
                     timeout=10,
                 )
             else:
