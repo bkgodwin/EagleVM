@@ -326,9 +326,11 @@ def ensure_proxmox_password() -> str:
     if encrypted:
         try:
             password = decrypt_secret(encrypted, "Proxmox root password", PROXMOX_PASSWORD_KEY)
-        except RuntimeError:
+        except RuntimeError as exc:
             if not os.isatty(0):
-                raise
+                raise RuntimeError(
+                    f"{exc} Start once in an interactive terminal after clearing it to save a replacement."
+                ) from exc
             logger.warning(
                 "Stored Proxmox root password could not be decrypted; prompting for a replacement."
             )
