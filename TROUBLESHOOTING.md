@@ -64,7 +64,9 @@ Interpretation:
 
 In VM GUI mode, ensure the VM can send return traffic back to the Proxmox host. If you block
 `192.168.0.0/16` (or similar) in OUTPUT rules, add an allow entry for the Proxmox host IP first.
-The app now auto-adds `<proxmox_host>/32` for GUI VMs when `proxmox_host` resolves to IPv4.
+The app now auto-adds the Proxmox host's routed source IPv4 (`ip route get <vm_ip>`) and any
+resolved `<proxmox_host>/32` entries for GUI VMs, so built-in OUTPUT filtering should not block
+the VNC tunnel's return traffic.
 
 ---
 

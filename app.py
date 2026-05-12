@@ -305,6 +305,40 @@ def resolve_host_ipv4_addrs(host: str) -> list[str]:
     return resolved
 
 
+async def resolve_route_source_ipv4(destination: str) -> str | None:
+    """Return the Proxmox host IPv4 source address used to reach ``destination``."""
+    try:
+        output = await run_ssh(f"ip -4 route get {shlex.quote(destination)}", timeout=15)
+    except Exception as exc:
+        logger.warning("Could not resolve route source IP for %s: %s", destination, exc)
+        return None
+    match = re.search(r"\bsrc (\d+\.\d+\.\d+\.\d+)\b", output)
+    if match:
+        return match.group(1)
+    logger.warning("Could not parse route source IP for %s from %r", destination, output)
+    return None
+
+
+async def resolve_gui_vm_allowlist(vm_ip: str, cfg: dict[str, Any]) -> list[str]:
+    """Return unique IPv4 /32 entries that must stay reachable for GUI VM tunnels."""
+    allowlist: list[str] = []
+    seen: set[str] = set()
+
+    route_source_ip = await resolve_route_source_ipv4(vm_ip)
+    if route_source_ip:
+        cidr = f"{route_source_ip}/32"
+        seen.add(cidr)
+        allowlist.append(cidr)
+
+    proxmox_host = str(cfg.get("proxmox_host", "")).strip()
+    for addr in resolve_host_ipv4_addrs(proxmox_host):
+        cidr = f"{addr}/32"
+        if cidr not in seen:
+            seen.add(cidr)
+            allowlist.append(cidr)
+    return allowlist
+
+
 def get_fernet() -> Fernet:
     global _FERNET_CACHE
     if _FERNET_CACHE is not None:
@@ -915,9 +949,7 @@ async def launch(request: Request):
                     )
             vm_gui_allowlist: list[str] = []
             if is_gui:
-                proxmox_host = str(cfg.get("proxmox_host", "")).strip()
-                for addr in resolve_host_ipv4_addrs(proxmox_host):
-                    vm_gui_allowlist.append(f"{addr}/32")
+                vm_gui_allowlist = await resolve_gui_vm_allowlist(ip, cfg)
                 if vm_gui_allowlist:
                     logger.info(
                         "Session %s: allowing Proxmox host return traffic for GUI VM %s via %s",
@@ -1142,7 +1174,7 @@ async def gui_session(websocket: WebSocket, session_id: str):
     from the Proxmox host to the container's VNC port (5900) without exposing it externally.
     """
     validate_session_id(session_id)
-    await websocket.accept(subprotocol="binary")
+    await websocket.accept()
 
     with StateLock():
         state = read_state()
