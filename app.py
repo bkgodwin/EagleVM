@@ -314,17 +314,19 @@ async def resolve_route_source_ipv4(destination: str) -> str | None:
         logger.warning("Could not resolve route source IP for invalid destination %r", destination)
         return None
     try:
-        output = await run_ssh(f"ip -4 route get {shlex.quote(destination_ip)}", timeout=15)
+        output = await run_ssh(f"ip -4 route get {destination_ip}", timeout=15)
     except Exception as exc:
         logger.warning("Could not resolve route source IP for %s: %s", destination_ip, exc)
         return None
-    match = re.search(r"\bsrc (\d+\.\d+\.\d+\.\d+)\b", output)
-    if match:
-        try:
-            return str(ipaddress.IPv4Address(match.group(1)))
-        except ipaddress.AddressValueError:
-            logger.warning("Could not parse valid route source IP for %s from %r", destination_ip, output)
-            return None
+    tokens = output.split()
+    if "src" in tokens:
+        src_index = tokens.index("src")
+        if src_index + 1 < len(tokens):
+            try:
+                return str(ipaddress.IPv4Address(tokens[src_index + 1]))
+            except ipaddress.AddressValueError:
+                logger.warning("Could not parse valid route source IP for %s from %r", destination_ip, output)
+                return None
     logger.warning("Could not parse route source IP for %s from %r", destination_ip, output)
     return None
 
