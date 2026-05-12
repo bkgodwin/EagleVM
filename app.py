@@ -361,30 +361,30 @@ def ensure_gui_vm_password() -> str:
 
     cfg = load_config()
     encrypted = cfg.get(GUI_VM_PASSWORD_KEY, "").strip()
+    password = ""
     if encrypted:
         try:
             password = decrypt_secret(encrypted, "GUI VM password", GUI_VM_PASSWORD_KEY)
         except RuntimeError as exc:
-            logger.debug("Stored GUI VM password decryption failed.", exc_info=exc)
+            logger.debug("Stored GUI VM password decryption failed", exc_info=exc)
             if os.isatty(0):
                 logger.warning("Stored GUI VM password could not be decrypted; prompting for a replacement.")
-                password = prompt_for_gui_vm_password()
-                if password:
+                prompted_password = prompt_for_gui_vm_password()
+                if prompted_password:
+                    password = prompted_password
                     cfg[GUI_VM_PASSWORD_KEY] = encrypt_secret(password)
                     save_config(cfg)
                     logger.info("Encrypted GUI VM password stored in %s", CONFIG_PATH)
-                else:
-                    password = ""
             else:
                 logger.warning(
                     "Stored GUI VM password could not be decrypted. Clear the GUI VM password setting in %s "
                     "to re-enter it later. No credentials will be shown.",
                     CONFIG_PATH,
                 )
-                password = ""
     elif os.isatty(0):
-        password = prompt_for_gui_vm_password()
-        if password:
+        prompted_password = prompt_for_gui_vm_password()
+        if prompted_password:
+            password = prompted_password
             cfg[GUI_VM_PASSWORD_KEY] = encrypt_secret(password)
             save_config(cfg)
             logger.info("Encrypted GUI VM password stored in %s", CONFIG_PATH)
