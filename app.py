@@ -58,6 +58,7 @@ STARTUP_PHASE_LABELS = {
     "ready": "Ready",
     "failed": "Failed",
 }
+JOURNAL_QUERY_BUFFER_SECONDS = 5
 
 
 @asynccontextmanager
@@ -727,6 +728,7 @@ def ssh_cmd(remote: str, timeout: int = 60) -> str:
                     stdout=partial_out,
                     stderr=partial_err,
                 )
+            # ssh_cmd runs inside asyncio.to_thread(), so this polling sleep does not block the event loop.
             time.sleep(0.1)
         exit_code = channel.recv_exit_status()
         out = b"".join(chunks_out).decode(errors="replace").strip()
@@ -756,7 +758,10 @@ async def run_ssh(remote: str, timeout: int = 60) -> str:
 
 
 async def fetch_proxmox_task_log(vmid: int, since_epoch: float) -> str | None:
-    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(max(0, since_epoch - 5)))
+    since = time.strftime(
+        "%Y-%m-%d %H:%M:%S",
+        time.localtime(max(0, since_epoch - JOURNAL_QUERY_BUFFER_SECONDS)),
+    )
     command = (
         "LOGS=$(journalctl -u pvedaemon "
         f"--since {shlex.quote(since)} --no-pager -n 200 | grep -F -- {shlex.quote(str(vmid))} | tail -n 40); "
