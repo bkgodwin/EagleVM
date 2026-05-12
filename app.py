@@ -312,6 +312,10 @@ def prompt_for_proxmox_password() -> str:
     return password
 
 
+def prompt_for_gui_vm_password() -> str:
+    return getpass.getpass("Enter GUI VM user password (displayed to session users): ")
+
+
 def ensure_proxmox_password() -> str:
     global _PROXMOX_PASSWORD_CACHE
     if _PROXMOX_PASSWORD_CACHE is not None:
@@ -361,7 +365,7 @@ def ensure_gui_vm_password() -> str:
         except RuntimeError:
             if os.isatty(0):
                 logger.warning("Stored GUI VM password could not be decrypted; prompting for a replacement.")
-                password = getpass.getpass("Enter GUI VM user password (displayed to session users): ")
+                password = prompt_for_gui_vm_password()
                 if password:
                     cfg[GUI_VM_PASSWORD_KEY] = encrypt_secret(password)
                     save_config(cfg)
@@ -370,14 +374,13 @@ def ensure_gui_vm_password() -> str:
                     password = ""
             else:
                 logger.warning(
-                    "Stored GUI VM password could not be decrypted. Clear %s in %s to re-enter it later. "
-                    "No credentials will be shown.",
-                    GUI_VM_PASSWORD_KEY,
+                    "Stored GUI VM password could not be decrypted. Clear the GUI VM password setting in %s "
+                    "to re-enter it later. No credentials will be shown.",
                     CONFIG_PATH,
                 )
                 password = ""
     elif os.isatty(0):
-        password = getpass.getpass("Enter GUI VM user password (displayed to session users): ")
+        password = prompt_for_gui_vm_password()
         if password:
             cfg[GUI_VM_PASSWORD_KEY] = encrypt_secret(password)
             save_config(cfg)
