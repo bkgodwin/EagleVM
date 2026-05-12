@@ -949,6 +949,7 @@ async def launch(request: Request):
                     )
             vm_gui_allowlist: list[str] = []
             if is_gui:
+                proxmox_host = str(cfg.get("proxmox_host", "")).strip()
                 vm_gui_allowlist = await resolve_gui_vm_allowlist(ip, cfg)
                 if vm_gui_allowlist:
                     logger.info(
