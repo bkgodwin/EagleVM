@@ -561,10 +561,43 @@ async def wait_for_container(vmid: int, timeout: int) -> str:
     raise TimeoutError("container did not boot with an IPv4 address")
 
 
+async def get_vm_mac(vmid: int) -> str | None:
+    """Return the lowercase MAC address for net0 of a QEMU VM, or None on failure."""
+    try:
+        output = await run_ssh(f"qm config {vmid}", timeout=15)
+        for line in output.splitlines():
+            if line.startswith("net0:"):
+                # e.g. "net0: virtio=BC:24:11:AA:BB:CC,bridge=vmbr0,firewall=0"
+                m = re.search(r"=([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", line)
+                if m:
+                    return m.group(1).lower()
+    except Exception:
+        pass
+    return None
+
+
 async def wait_for_vm(vmid: int, timeout: int) -> str:
-    """Wait for a QEMU VM's guest agent to report a non-loopback IPv4 address."""
+    """Wait for a QEMU VM to obtain a routable IPv4 address.
+
+    Two methods are tried on every poll iteration:
+
+    1. **Guest agent** – ``qm agent {vmid} network-get-interfaces`` (requires
+       the QEMU guest agent to be installed and running inside the VM).
+    2. **ARP fallback** – looks up the VM's MAC address from ``qm config`` and
+       then checks the Proxmox host's neighbour table (``ip neigh show``) for a
+       matching entry.  This works even when the guest agent is not installed.
+    """
     deadline = time.time() + timeout
+    # Fetch the VM's MAC once so we can use it for ARP lookups without an extra
+    # SSH round-trip on every iteration.
+    mac = await get_vm_mac(vmid)
+    if mac is None:
+        logger.warning(
+            "VM %s: could not retrieve MAC address from qm config; ARP fallback will be skipped",
+            vmid,
+        )
     while time.time() < deadline:
+        # --- method 1: QEMU guest agent ---
         try:
             output = await run_ssh(f"qm agent {vmid} network-get-interfaces", timeout=15)
             if output:
@@ -576,11 +609,32 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
                         if addr.get("ip-address-type") == "ipv4":
                             ip = addr["ip-address"]
                             if not ip.startswith("127."):
+                                logger.info("VM %s IP via guest agent: %s", vmid, ip)
                                 return ip
         except Exception:
             pass
+
+        # --- method 2: ARP / neighbour-table fallback ---
+        if mac:
+            try:
+                neigh = await run_ssh(
+                    f"ip neigh show | grep -i {shlex.quote(mac)}", timeout=15
+                )
+                for line in neigh.splitlines():
+                    parts = line.split()
+                    if parts and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
+                        ip = parts[0]
+                        if not ip.startswith("127."):
+                            logger.info("VM %s IP via ARP fallback: %s", vmid, ip)
+                            return ip
+            except Exception:
+                pass
+
         await asyncio.sleep(2)
-    raise TimeoutError("VM did not boot with an IPv4 address via guest agent")
+    raise TimeoutError(
+        "VM did not boot with a routable IPv4 address "
+        "(tried QEMU guest agent and ARP/neighbour-table lookup)"
+    )
 
 
 def open_vm_ssh_client(vm_ip: str, password: str, timeout: int = 30) -> paramiko.SSHClient:
