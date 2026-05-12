@@ -1,7 +1,7 @@
 # LXChoster
 
 LXChoster is a FastAPI/xterm.js web app that creates temporary Proxmox LXC sessions from a template.
-Users press Launch to create a temporary root shell session. The app generates an internal random root password for the temporary container before attaching the browser terminal.
+Users press Launch to create a temporary root shell session. The app generates an internal random root password for the temporary container before attaching the browser terminal, and the web UI now shows live startup phases plus a progress bar while the guest is being cloned and booted.
 On first startup, the app prompts for the Proxmox root password and stores an encrypted value in `config.json` for subsequent runs.
 
 ## Config
