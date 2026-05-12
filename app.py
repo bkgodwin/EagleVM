@@ -293,17 +293,50 @@ def set_session_startup(
     *,
     error: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    return mutate_session(
-        session_id,
-        lambda session: session.__setitem__("startup", build_startup_state(phase, message, percent, error=error)),
-    )
+    def _set_startup(session: dict[str, Any]) -> None:
+        session["startup"] = build_startup_state(phase, message, percent, error=error)
+
+    return mutate_session(session_id, _set_startup)
 
 
 def set_gui_tunnel_status(session_id: str, state: str, message: str, **extra: Any) -> dict[str, Any] | None:
-    return mutate_session(
-        session_id,
-        lambda session: session.__setitem__("gui_tunnel", build_gui_tunnel_state(state, message, **extra)),
-    )
+    def _set_gui_tunnel(session: dict[str, Any]) -> None:
+        session["gui_tunnel"] = build_gui_tunnel_state(state, message, **extra)
+
+    return mutate_session(session_id, _set_gui_tunnel)
+
+
+def set_startup_cleanup_error(session: dict[str, Any], cleanup_error: str) -> None:
+    startup = session.setdefault("startup", {})
+    error = startup.setdefault("error", {})
+    error["cleanup_error"] = cleanup_error
+
+
+class RemoteCommandError(RuntimeError):
+    """Raised when a remote SSH command fails or returns a non-zero exit code."""
+
+    def __init__(
+        self,
+        remote: str,
+        message: str,
+        *,
+        timeout: int | None = None,
+        exit_code: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.remote = remote
+        self.timeout = timeout
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class RemoteCommandTimeout(RemoteCommandError):
+    """Raised when a remote SSH command does not finish before its timeout expires."""
+
+    pass
 
 
 def serialize_session_payload(
@@ -664,29 +697,6 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
         client.close()
         raise RuntimeError(f"SSH connection to {cfg['proxmox_host']} failed: {exc}") from exc
     return client
-
-
-class RemoteCommandError(RuntimeError):
-    def __init__(
-        self,
-        remote: str,
-        message: str,
-        *,
-        timeout: int | None = None,
-        exit_code: int | None = None,
-        stdout: str = "",
-        stderr: str = "",
-    ) -> None:
-        super().__init__(message)
-        self.remote = remote
-        self.timeout = timeout
-        self.exit_code = exit_code
-        self.stdout = stdout
-        self.stderr = stderr
-
-
-class RemoteCommandTimeout(RemoteCommandError):
-    pass
 
 
 def ssh_cmd(remote: str, timeout: int = 60) -> str:
@@ -1202,9 +1212,7 @@ async def provision_session(session_id: str) -> None:
             logger.error("Session %s cleanup after startup failure also failed: %s", session_id, cleanup_exc, exc_info=True)
             mutate_session(
                 session_id,
-                lambda current: current.setdefault("startup", {}).setdefault("error", {}).__setitem__(
-                    "cleanup_error", str(cleanup_exc)
-                ),
+                lambda current: set_startup_cleanup_error(current, str(cleanup_exc)),
             )
         return
 
