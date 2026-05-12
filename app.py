@@ -60,8 +60,11 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="LXChoster", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+_log_level_raw = os.environ.get("LOG_LEVEL", "INFO").upper()
 # Set LOG_LEVEL=DEBUG in the environment for verbose command-level and poll-level logging.
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
+_log_level = _log_level_raw if _log_level_raw in _VALID_LOG_LEVELS else "INFO"
+logging.basicConfig(level=_log_level, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("lxchoster")
 _PROXMOX_PASSWORD_CACHE: str | None = None
 _GUI_VM_PASSWORD_CACHE: str | None = None
@@ -571,7 +574,7 @@ async def wait_for_container(vmid: int, timeout: int) -> str:
         await asyncio.sleep(2)
     raise TimeoutError(
         f"container {vmid} did not boot with an IPv4 address after {timeout}s ({poll} polls); "
-        "check that the template has a DHCP-capable network interface and that the bridge is correct"
+        f"check that the template has a DHCP-capable network interface and that the bridge is correct"
     )
 
 
@@ -654,8 +657,8 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
         await asyncio.sleep(2)
     raise TimeoutError(
         f"VM {vmid} did not boot with a routable IPv4 address after {timeout}s ({poll} polls) "
-        "(tried QEMU guest agent and ARP/neighbour-table lookup); "
-        "check that qemu-guest-agent is installed in the template or that the VM's MAC is visible in 'ip neigh'"
+        f"(tried QEMU guest agent and ARP/neighbour-table lookup); "
+        f"check that qemu-guest-agent is installed in the template or that the VM's MAC is visible in 'ip neigh'"
     )
 
 
