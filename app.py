@@ -290,13 +290,13 @@ def encrypt_secret(value: str) -> str:
     return get_fernet().encrypt(value.encode()).decode()
 
 
-def decrypt_secret(value: str) -> str:
+def decrypt_secret(value: str, secret_label: str, config_key: str) -> str:
     try:
         return get_fernet().decrypt(value.encode()).decode()
     except InvalidToken as exc:
         raise RuntimeError(
-            "Failed to decrypt stored Proxmox root password. "
-            "If needed, clear proxmox_root_password_encrypted in config.json and restart to re-enter it."
+            f"Failed to decrypt stored {secret_label}. "
+            f"If needed, clear {config_key} in {CONFIG_PATH.name} and restart to re-enter it."
         ) from exc
 
 
@@ -312,6 +312,10 @@ def prompt_for_proxmox_password() -> str:
     return password
 
 
+def prompt_for_gui_vm_password() -> str:
+    return getpass.getpass("Enter GUI VM user password (displayed to session users): ")
+
+
 def ensure_proxmox_password() -> str:
     global _PROXMOX_PASSWORD_CACHE
     if _PROXMOX_PASSWORD_CACHE is not None:
@@ -320,7 +324,20 @@ def ensure_proxmox_password() -> str:
     cfg = load_config()
     encrypted = cfg.get(PROXMOX_PASSWORD_KEY, "").strip()
     if encrypted:
-        password = decrypt_secret(encrypted)
+        try:
+            password = decrypt_secret(encrypted, "Proxmox root password", PROXMOX_PASSWORD_KEY)
+        except RuntimeError as exc:
+            if not os.isatty(0):
+                raise RuntimeError(
+                    f"{str(exc)} Start once in an interactive terminal after clearing that config key to save a replacement."
+                ) from exc
+            logger.warning(
+                "Stored Proxmox root password could not be decrypted; prompting for a replacement."
+            )
+            password = prompt_for_proxmox_password()
+            cfg[PROXMOX_PASSWORD_KEY] = encrypt_secret(password)
+            save_config(cfg)
+            logger.info("Encrypted Proxmox root password stored in %s", CONFIG_PATH)
     else:
         password = prompt_for_proxmox_password()
         cfg[PROXMOX_PASSWORD_KEY] = encrypt_secret(password)
@@ -344,11 +361,30 @@ def ensure_gui_vm_password() -> str:
 
     cfg = load_config()
     encrypted = cfg.get(GUI_VM_PASSWORD_KEY, "").strip()
+    password = ""
     if encrypted:
-        password = decrypt_secret(encrypted)
+        try:
+            password = decrypt_secret(encrypted, "GUI VM password", GUI_VM_PASSWORD_KEY)
+        except RuntimeError as exc:
+            logger.debug("Stored GUI VM password decryption failed", exc_info=exc)
+            if os.isatty(0):
+                logger.warning("Stored GUI VM password could not be decrypted; prompting for a replacement.")
+                prompted_password = prompt_for_gui_vm_password()
+                if prompted_password:
+                    password = prompted_password
+                    cfg[GUI_VM_PASSWORD_KEY] = encrypt_secret(password)
+                    save_config(cfg)
+                    logger.info("Encrypted GUI VM password stored in %s", CONFIG_PATH)
+            else:
+                logger.warning(
+                    "Stored GUI VM password could not be decrypted. Clear the GUI VM password setting in %s "
+                    "to re-enter it later. No credentials will be shown.",
+                    CONFIG_PATH,
+                )
     elif os.isatty(0):
-        password = getpass.getpass("Enter GUI VM user password (displayed to session users): ")
-        if password:
+        prompted_password = prompt_for_gui_vm_password()
+        if prompted_password:
+            password = prompted_password
             cfg[GUI_VM_PASSWORD_KEY] = encrypt_secret(password)
             save_config(cfg)
             logger.info("Encrypted GUI VM password stored in %s", CONFIG_PATH)
