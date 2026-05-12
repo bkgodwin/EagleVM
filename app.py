@@ -3,6 +3,7 @@ import base64
 import csv
 import fcntl
 import getpass
+import ipaddress
 import json
 import logging
 import os
@@ -303,6 +304,54 @@ def resolve_host_ipv4_addrs(host: str) -> list[str]:
             seen.add(addr)
             resolved.append(addr)
     return resolved
+
+
+async def resolve_route_source_ipv4(destination: str) -> str | None:
+    """Return the Proxmox host IPv4 source address used to reach ``destination``, or None.
+
+    This runs ``ip -4 route get`` on the Proxmox host over SSH with a 15-second timeout.
+    """
+    try:
+        destination_ip = str(ipaddress.IPv4Address(destination))
+    except ipaddress.AddressValueError:
+        logger.warning("Could not resolve route source IP for invalid destination %r", destination)
+        return None
+    try:
+        output = await run_ssh(shlex.join(["ip", "-4", "route", "get", destination_ip]), timeout=15)
+    except Exception as exc:
+        logger.warning("Could not resolve route source IP for %s: %s", destination_ip, exc)
+        return None
+    tokens = output.split()
+    if "src" in tokens:
+        src_index = tokens.index("src")
+        if src_index + 1 < len(tokens):
+            try:
+                return str(ipaddress.IPv4Address(tokens[src_index + 1]))
+            except ipaddress.AddressValueError:
+                logger.warning("Could not parse valid route source IP for %s from %r", destination_ip, output)
+                return None
+    logger.warning("Could not parse route source IP for %s from %r", destination_ip, output)
+    return None
+
+
+async def resolve_gui_vm_allowlist(vm_ip: str, cfg: dict[str, Any]) -> list[str]:
+    """Return unique IPv4 /32 entries that must stay reachable for GUI VM tunnels."""
+    allowlist: list[str] = []
+    seen: set[str] = set()
+
+    route_source_ip = await resolve_route_source_ipv4(vm_ip)
+    if route_source_ip:
+        cidr = f"{route_source_ip}/32"
+        seen.add(cidr)
+        allowlist.append(cidr)
+
+    proxmox_host = str(cfg.get("proxmox_host", "")).strip()
+    for addr in resolve_host_ipv4_addrs(proxmox_host):
+        cidr = f"{addr}/32"
+        if cidr not in seen:
+            seen.add(cidr)
+            allowlist.append(cidr)
+    return allowlist
 
 
 def get_fernet() -> Fernet:
@@ -916,8 +965,7 @@ async def launch(request: Request):
             vm_gui_allowlist: list[str] = []
             if is_gui:
                 proxmox_host = str(cfg.get("proxmox_host", "")).strip()
-                for addr in resolve_host_ipv4_addrs(proxmox_host):
-                    vm_gui_allowlist.append(f"{addr}/32")
+                vm_gui_allowlist = await resolve_gui_vm_allowlist(ip, cfg)
                 if vm_gui_allowlist:
                     logger.info(
                         "Session %s: allowing Proxmox host return traffic for GUI VM %s via %s",
@@ -1142,7 +1190,7 @@ async def gui_session(websocket: WebSocket, session_id: str):
     from the Proxmox host to the container's VNC port (5900) without exposing it externally.
     """
     validate_session_id(session_id)
-    await websocket.accept(subprotocol="binary")
+    await websocket.accept()
 
     with StateLock():
         state = read_state()
