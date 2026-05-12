@@ -9,6 +9,7 @@
 | `Session XXX creation failed: VM … did not boot with a routable IPv4 address` | QEMU VM started but guest agent unreachable *and* MAC not visible in `ip neigh` |
 | `Session XXX creation failed: remote command failed with exit code …` | A Proxmox CLI command (`pct clone`, `pct start`, `qm clone`, etc.) returned non-zero |
 | `Session XXX creation failed: SSH connection … failed` | Cannot reach the Proxmox host over SSH at the point of that command |
+| Session launches but GUI canvas stays blank / disconnects quickly | VNC inside VM is running, but tunnel traffic is being interrupted (most commonly by guest OUTPUT block rules to local subnets) |
 
 ---
 
@@ -43,6 +44,27 @@ DEBUG Container 8001 poll #2 error: remote command failed with exit code 1
 ```
 
 This immediately tells you *which step* is failing and *why*.
+
+---
+
+## VM GUI blank display / immediate disconnect
+
+If VM session creation succeeds but GUI streaming fails, collect the new GUI tunnel logs:
+
+- `GUI tunnel setup session_id=... target=<vm_ip>:5900 ...`
+- `GUI tunnel channel opened session_id=...`
+- `GUI tunnel completed ... first_disconnect_side=... reason=...`
+- `GUI tunnel teardown ...`
+
+Interpretation:
+
+- `Failed to open VNC channel ...` means tunnel setup failed before display traffic started.
+- `first_disconnect_side=ssh` usually means the VM-side VNC channel closed first (check x11vnc inside VM).
+- `first_disconnect_side=websocket` usually means browser/socket side closed first.
+
+In VM GUI mode, ensure the VM can send return traffic back to the Proxmox host. If you block
+`192.168.0.0/16` (or similar) in OUTPUT rules, add an allow entry for the Proxmox host IP first.
+The app now auto-adds `<proxmox_host>/32` for GUI VMs when `proxmox_host` resolves to IPv4.
 
 ---
 

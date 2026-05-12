@@ -225,9 +225,16 @@ def normalize_client_id(value: str | None) -> str | None:
     return cleaned
 
 
-async def apply_network_restrictions(vmid: int, cfg: dict[str, Any], is_vm: bool) -> None:
+async def apply_network_restrictions(
+    vmid: int,
+    cfg: dict[str, Any],
+    is_vm: bool,
+    extra_allowlist: list[str] | None = None,
+) -> None:
     blocklist = [str(item).strip() for item in cfg.get("local_network_blocklist", []) if str(item).strip()]
     allowlist = [str(item).strip() for item in cfg.get("local_network_allowlist", []) if str(item).strip()]
+    if extra_allowlist:
+        allowlist.extend(str(item).strip() for item in extra_allowlist if str(item).strip())
     allow_set = set(allowlist)
     blocked = [cidr for cidr in blocklist if cidr not in allow_set]
     if not blocked:
@@ -275,6 +282,26 @@ async def apply_network_restrictions(vmid: int, cfg: dict[str, Any], is_vm: bool
         await run_ssh(f"qm guest exec {vmid} sh -lc {shlex.quote(script)}", timeout=60)
     else:
         await run_ssh(f"pct exec {vmid} -- sh -lc {shlex.quote(script)}", timeout=60)
+
+
+def resolve_host_ipv4_addrs(host: str) -> list[str]:
+    """Resolve a host to IPv4 addresses, returning unique values in order."""
+    resolved: list[str] = []
+    host_value = host.strip()
+    if not host_value:
+        return resolved
+    try:
+        infos = socket.getaddrinfo(host_value, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as exc:
+        logger.warning("Could not resolve host %r to IPv4: %s", host_value, exc)
+        return resolved
+    seen: set[str] = set()
+    for info in infos:
+        addr = info[4][0]
+        if addr not in seen:
+            seen.add(addr)
+            resolved.append(addr)
+    return resolved
 
 
 def get_fernet() -> Fernet:
@@ -885,8 +912,27 @@ async def launch(request: Request):
                         "gui_vm_username %r contains invalid characters; skipping chpasswd",
                         gui_vm_username,
                     )
+            vm_gui_allowlist: list[str] = []
+            if is_gui:
+                proxmox_host = str(cfg.get("proxmox_host", "")).strip()
+                for addr in resolve_host_ipv4_addrs(proxmox_host):
+                    vm_gui_allowlist.append(f"{addr}/32")
+                if vm_gui_allowlist:
+                    logger.info(
+                        "Session %s: allowing Proxmox host return traffic for GUI VM %s via %s",
+                        session_id,
+                        vmid,
+                        ", ".join(vm_gui_allowlist),
+                    )
+                else:
+                    logger.warning(
+                        "Session %s: could not resolve proxmox_host=%r to IPv4 for GUI VM %s allowlist",
+                        session_id,
+                        proxmox_host,
+                        vmid,
+                    )
             logger.info("Session %s: applying network restrictions to vmid %s", session_id, vmid)
-            await apply_network_restrictions(vmid, cfg, is_vm=True)
+            await apply_network_restrictions(vmid, cfg, is_vm=True, extra_allowlist=vm_gui_allowlist)
             if is_gui:
                 logger.info("Session %s: starting GUI services on vmid %s", session_id, vmid)
                 await start_gui_services(vmid, vnc_password, is_vm=True)
@@ -1111,6 +1157,13 @@ async def gui_session(websocket: WebSocket, session_id: str):
 
     container_ip = str(session["ip"])
     client_id = str(session.get("client_id", ""))
+    vnc_target = (container_ip, 5900)
+    disconnect_info: dict[str, str | None] = {"side": None, "reason": None}
+
+    def note_disconnect(side: str, reason: str) -> None:
+        if disconnect_info["side"] is None:
+            disconnect_info["side"] = side
+            disconnect_info["reason"] = reason
 
     client = await asyncio.to_thread(open_ssh_client, 10)
     transport = client.get_transport()
@@ -1120,15 +1173,34 @@ async def gui_session(websocket: WebSocket, session_id: str):
         await websocket.close(code=1011)
         return
 
+    logger.debug(
+        "GUI tunnel setup session_id=%s target=%s:%d client_id=%s",
+        session_id,
+        vnc_target[0],
+        vnc_target[1],
+        client_id,
+    )
     try:
         channel = await asyncio.to_thread(
             transport.open_channel,
             "direct-tcpip",
-            (container_ip, 5900),
+            vnc_target,
             ("127.0.0.1", 0),
         )
+        logger.debug(
+            "GUI tunnel channel opened session_id=%s target=%s:%d",
+            session_id,
+            vnc_target[0],
+            vnc_target[1],
+        )
     except Exception as exc:
-        logger.error("Failed to open VNC channel for session %s: %s", session_id, exc)
+        logger.error(
+            "Failed to open VNC channel for session %s target=%s:%d: %s",
+            session_id,
+            vnc_target[0],
+            vnc_target[1],
+            exc,
+        )
         client.close()
         await websocket.close(code=1011)
         return
@@ -1138,11 +1210,13 @@ async def gui_session(websocket: WebSocket, session_id: str):
             if await asyncio.to_thread(channel.recv_ready):
                 data = await asyncio.to_thread(channel.recv, 16384)
                 if not data:
+                    note_disconnect("ssh", "vnc channel EOF")
                     break
                 if (
                     websocket.application_state != WebSocketState.CONNECTED
                     or websocket.client_state != WebSocketState.CONNECTED
                 ):
+                    note_disconnect("websocket", "websocket no longer connected while sending VNC data")
                     break
                 try:
                     await websocket.send_bytes(data)
@@ -1151,10 +1225,12 @@ async def gui_session(websocket: WebSocket, session_id: str):
                         websocket.application_state != WebSocketState.CONNECTED
                         or websocket.client_state != WebSocketState.CONNECTED
                     ):
+                        note_disconnect("websocket", "websocket closed while sending VNC data")
                         break
                     raise
                 continue
             if await asyncio.to_thread(lambda: channel.closed):
+                note_disconnect("ssh", "vnc channel closed")
                 break
             await asyncio.sleep(0.1)
 
@@ -1162,9 +1238,11 @@ async def gui_session(websocket: WebSocket, session_id: str):
         while True:
             try:
                 msg = await websocket.receive()
-            except WebSocketDisconnect:
+            except WebSocketDisconnect as exc:
+                note_disconnect("websocket", f"websocket disconnect code={exc.code}")
                 break
             if msg.get("type") != "websocket.receive":
+                note_disconnect("websocket", f"websocket message type={msg.get('type')}")
                 break
             with StateLock():
                 state = read_state()
@@ -1177,13 +1255,29 @@ async def gui_session(websocket: WebSocket, session_id: str):
             elif "text" in msg and msg["text"] is not None:
                 data = msg["text"].encode()
             if data:
-                await asyncio.to_thread(channel.send, data)
+                try:
+                    await asyncio.to_thread(channel.send, data)
+                except Exception as exc:
+                    note_disconnect("ssh", f"channel send failed: {exc}")
+                    raise
 
     ws_task = asyncio.create_task(ws_to_vnc())
     vnc_task = asyncio.create_task(vnc_to_ws())
     try:
         completed_tasks, pending_tasks = await asyncio.wait(
             {vnc_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        completed_names = []
+        if vnc_task in completed_tasks:
+            completed_names.append("vnc_to_ws")
+        if ws_task in completed_tasks:
+            completed_names.append("ws_to_vnc")
+        logger.debug(
+            "GUI tunnel completed session_id=%s first_disconnect_side=%s reason=%s completed_tasks=%s",
+            session_id,
+            disconnect_info["side"] or "unknown",
+            disconnect_info["reason"] or "not recorded",
+            ",".join(completed_names) or "none",
         )
         for task in pending_tasks:
             task.cancel()
@@ -1192,9 +1286,19 @@ async def gui_session(websocket: WebSocket, session_id: str):
             exc = task.exception()
             if exc and not isinstance(exc, WebSocketDisconnect):
                 raise exc
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as exc:
+        note_disconnect("websocket", f"websocket disconnect code={exc.code}")
         pass
     finally:
+        logger.debug(
+            "GUI tunnel teardown session_id=%s first_disconnect_side=%s reason=%s channel_closed=%s ws_app_state=%s ws_client_state=%s",
+            session_id,
+            disconnect_info["side"] or "unknown",
+            disconnect_info["reason"] or "not recorded",
+            channel.closed,
+            websocket.application_state,
+            websocket.client_state,
+        )
         channel.close()
         client.close()
         # Keep sessions reconnectable until inactivity timeout instead of destroying on disconnect.
