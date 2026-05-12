@@ -329,7 +329,7 @@ def ensure_proxmox_password() -> str:
         except RuntimeError as exc:
             if not os.isatty(0):
                 raise RuntimeError(
-                    f"{exc} Start once in an interactive terminal after clearing it to save a replacement."
+                    f"{exc} Start once in an interactive terminal after clearing that config key to save a replacement."
                 ) from exc
             logger.warning(
                 "Stored Proxmox root password could not be decrypted; prompting for a replacement."
@@ -364,7 +364,8 @@ def ensure_gui_vm_password() -> str:
     if encrypted:
         try:
             password = decrypt_secret(encrypted, "GUI VM password", GUI_VM_PASSWORD_KEY)
-        except RuntimeError:
+        except RuntimeError as exc:
+            logger.debug("Stored GUI VM password decryption failed.", exc_info=exc)
             if os.isatty(0):
                 logger.warning("Stored GUI VM password could not be decrypted; prompting for a replacement.")
                 password = prompt_for_gui_vm_password()
