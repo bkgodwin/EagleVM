@@ -37,6 +37,17 @@ SECRET_KEY_PATH = STATE_DIR / "secret.key"
 PROXMOX_PASSWORD_KEY = "proxmox_root_password_encrypted"
 GUI_VM_PASSWORD_KEY = "gui_vm_password_encrypted"
 CLIENT_COOKIE_NAME = "lxchoster_client_id"
+# Seconds reserved for the TCP-connect + SSH banner + auth phase when opening a
+# new paramiko connection.  Kept separate from the *command* timeout so that the
+# hard asyncio-level safety timeouts applied to the polling loops are correct.
+_SSH_CONNECT_TIMEOUT = 15
+# Maximum seconds allowed for a single SSH command during the IP-polling loops.
+_MAX_POLL_CMD_TIMEOUT = 15
+# Additional seconds added to the polling-loop timeout when computing the hard
+# asyncio-level safety timeout (covers connection setup + a small buffer).
+_TIMEOUT_BUFFER_SECONDS = 5
+# Timeout for the one-shot get_vm_mac() call before the polling loop begins.
+_MAC_LOOKUP_TIMEOUT = 20
 SESSION_HISTORY_FIELDS = ["client_id", "session_id", "vmid", "hostname", "status", "updated_at"]
 COOKIE_MAX_AGE_SECONDS = 31536000
 MAX_CLIENT_ID_LENGTH = 120
@@ -700,43 +711,46 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
     return client
 
 
-def ssh_cmd(remote: str, timeout: int = 60) -> str:
-    logger.debug("SSH cmd (timeout=%ds): %s", timeout, remote)
-    client = open_ssh_client(timeout=timeout)
-    try:
-        _, stdout, stderr = client.exec_command(remote, timeout=timeout)
-        channel = stdout.channel
-        channel.settimeout(timeout)
-        chunks_out: list[bytes] = []
-        chunks_err: list[bytes] = []
-        deadline = time.monotonic() + timeout
-        while True:
-            while channel.recv_ready():
-                chunks_out.append(channel.recv(32768))
-            while channel.recv_stderr_ready():
-                chunks_err.append(channel.recv_stderr(32768))
-            if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
-                break
-            if time.monotonic() >= deadline:
-                partial_out = b"".join(chunks_out).decode(errors="replace").strip()
-                partial_err = b"".join(chunks_err).decode(errors="replace").strip()
-                channel.close()
-                raise RemoteCommandTimeout(
-                    remote,
-                    f"Remote command timed out after {timeout} seconds.",
-                    timeout=timeout,
-                    stdout=partial_out,
-                    stderr=partial_err,
-                )
-            # ssh_cmd runs inside asyncio.to_thread(), so this polling sleep does not block the event loop.
-            time.sleep(0.1)
-        exit_code = channel.recv_exit_status()
-        out = b"".join(chunks_out).decode(errors="replace").strip()
-        err = b"".join(chunks_err).decode(errors="replace").strip()
-    finally:
-        client.close()
+def _exec_via_client(client: paramiko.SSHClient, remote: str, timeout: int) -> str:
+    """Run *remote* on an already-open *client*; return stdout as a string.
+
+    Mirrors the channel-polling loop of ``ssh_cmd`` but accepts an existing
+    ``SSHClient`` so the SSH transport can be reused across multiple commands
+    without incurring a fresh KEX handshake on every call.
+
+    Raises ``RemoteCommandTimeout`` if the command does not finish within
+    *timeout* seconds.  Raises ``RemoteCommandError`` on a non-zero exit code.
+    """
+    _, stdout, stderr = client.exec_command(remote, timeout=timeout)
+    channel = stdout.channel
+    channel.settimeout(timeout)
+    chunks_out: list[bytes] = []
+    chunks_err: list[bytes] = []
+    deadline = time.monotonic() + timeout
+    while True:
+        while channel.recv_ready():
+            chunks_out.append(channel.recv(32768))
+        while channel.recv_stderr_ready():
+            chunks_err.append(channel.recv_stderr(32768))
+        if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+            break
+        if time.monotonic() >= deadline:
+            partial_out = b"".join(chunks_out).decode(errors="replace").strip()
+            partial_err = b"".join(chunks_err).decode(errors="replace").strip()
+            channel.close()
+            raise RemoteCommandTimeout(
+                remote,
+                f"Remote command timed out after {timeout} seconds.",
+                timeout=timeout,
+                stdout=partial_out,
+                stderr=partial_err,
+            )
+        # Runs inside a thread (asyncio.to_thread), so sleep does not block the event loop.
+        time.sleep(0.1)
+    exit_code = channel.recv_exit_status()
+    out = b"".join(chunks_out).decode(errors="replace").strip()
+    err = b"".join(chunks_err).decode(errors="replace").strip()
     if exit_code:
-        logger.debug("SSH cmd failed (exit=%d) stderr=%r stdout=%r cmd=%s", exit_code, err, out, remote)
         raise RemoteCommandError(
             remote,
             err or out or f"remote command failed with exit code {exit_code}",
@@ -744,6 +758,19 @@ def ssh_cmd(remote: str, timeout: int = 60) -> str:
             stdout=out,
             stderr=err,
         )
+    return out
+
+
+def ssh_cmd(remote: str, timeout: int = 60) -> str:
+    logger.debug("SSH cmd (timeout=%ds): %s", timeout, remote)
+    client = open_ssh_client(timeout=timeout)
+    try:
+        out = _exec_via_client(client, remote, timeout)
+    except RemoteCommandError as exc:
+        logger.debug("SSH cmd failed (exit=%d) stderr=%r stdout=%r cmd=%s", exc.exit_code, exc.stderr, exc.stdout, remote)
+        raise
+    finally:
+        client.close()
     logger.debug("SSH cmd ok (exit=0) output=%r", out)
     return out
 
@@ -1250,26 +1277,79 @@ async def provision_session(session_id: str) -> None:
         )
 
 
-async def wait_for_container(vmid: int, timeout: int) -> str:
+def _poll_container_ip_sync(vmid: int, timeout: int) -> str:
+    """Synchronous container IP polling loop that reuses a single SSH connection.
+
+    Intended to be executed inside ``asyncio.to_thread()``.  Opening one
+    connection for the entire loop avoids a fresh KEX handshake on every poll
+    and prevents the Proxmox SSH server from being flooded with rapid-fire
+    connection attempts (which can trigger OpenSSH ``MaxStartups`` throttling
+    and cause ``open_ssh_client`` to block far beyond its nominal timeout).
+    """
     logger.info("Waiting for container %s to obtain an IP address (timeout=%ds)", vmid, timeout)
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     poll = 0
-    while time.time() < deadline:
-        poll += 1
-        try:
-            output = await run_ssh(f"pct exec {vmid} -- hostname -I", timeout=15)
-            logger.debug("Container %s poll #%d hostname -I output: %r", vmid, poll, output)
-            if output:
-                ip = output.split()[0].strip()
-                logger.info("Container %s obtained IP %s after %d poll(s)", vmid, ip, poll)
-                return ip
-            logger.debug("Container %s poll #%d: hostname -I returned empty (no IP yet)", vmid, poll)
-        except Exception as exc:
-            logger.debug("Container %s poll #%d error: %s", vmid, poll, exc)
-        await asyncio.sleep(2)
+    client: paramiko.SSHClient | None = None
+
+    def _get_client() -> paramiko.SSHClient:
+        nonlocal client
+        if client is not None:
+            transport = client.get_transport()
+            if transport is not None and transport.is_active():
+                return client
+            try:
+                client.close()
+            except Exception:
+                pass
+        client = open_ssh_client(timeout=_SSH_CONNECT_TIMEOUT)
+        return client
+
+    try:
+        while time.monotonic() < deadline:
+            poll += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            cmd_timeout = min(_MAX_POLL_CMD_TIMEOUT, max(1, int(remaining)))
+            try:
+                c = _get_client()
+                output = _exec_via_client(c, f"pct exec {vmid} -- hostname -I", cmd_timeout)
+                logger.debug("Container %s poll #%d hostname -I output: %r", vmid, poll, output)
+                if output:
+                    ip = output.split()[0].strip()
+                    logger.info("Container %s obtained IP %s after %d poll(s)", vmid, ip, poll)
+                    return ip
+                logger.debug("Container %s poll #%d: hostname -I returned empty (no IP yet)", vmid, poll)
+            except Exception as exc:
+                logger.debug("Container %s poll #%d error: %s", vmid, poll, exc)
+                # Drop the connection so the next iteration opens a fresh one.
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = None
+            time.sleep(2)
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     raise TimeoutError(
         f"container {vmid} did not boot with an IPv4 address after {timeout}s ({poll} polls); "
         f"check that the template has a DHCP-capable network interface and that the bridge is correct"
+    )
+
+
+async def wait_for_container(vmid: int, timeout: int) -> str:
+    # Run the blocking polling loop in a thread with a hard asyncio-level safety
+    # timeout so a stalled SSH connection can never block the event loop indefinitely.
+    hard_timeout = timeout + _SSH_CONNECT_TIMEOUT + _TIMEOUT_BUFFER_SECONDS
+    return await asyncio.wait_for(
+        asyncio.to_thread(_poll_container_ip_sync, vmid, timeout),
+        timeout=hard_timeout,
     )
 
 
@@ -1288,6 +1368,112 @@ async def get_vm_mac(vmid: int) -> str | None:
     return None
 
 
+def _poll_vm_ip_sync(vmid: int, timeout: int, mac: str | None) -> str:
+    """Synchronous VM IP polling loop that reuses a single SSH connection.
+
+    Intended to be executed inside ``asyncio.to_thread()``.  Opening one
+    connection for the entire loop avoids a fresh KEX handshake on every poll
+    and prevents the Proxmox SSH server from being flooded with rapid-fire
+    connection attempts (which can trigger OpenSSH ``MaxStartups`` throttling
+    and cause ``open_ssh_client`` to block far beyond its nominal timeout).
+    """
+    logger.info("Waiting for VM %s to obtain a routable IPv4 address (timeout=%ds)", vmid, timeout)
+    deadline = time.monotonic() + timeout
+    poll = 0
+    client: paramiko.SSHClient | None = None
+
+    def _get_client() -> paramiko.SSHClient:
+        nonlocal client
+        if client is not None:
+            transport = client.get_transport()
+            if transport is not None and transport.is_active():
+                return client
+            try:
+                client.close()
+            except Exception:
+                pass
+        client = open_ssh_client(timeout=_SSH_CONNECT_TIMEOUT)
+        return client
+
+    def _drop_client() -> None:
+        nonlocal client
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+            client = None
+
+    try:
+        while time.monotonic() < deadline:
+            poll += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            cmd_timeout = min(_MAX_POLL_CMD_TIMEOUT, max(1, int(remaining)))
+            try:
+                c = _get_client()
+                output = _exec_via_client(
+                    c, f"qm agent {vmid} network-get-interfaces", cmd_timeout
+                )
+                if output:
+                    ifaces = json.loads(output)
+                    for iface in ifaces:
+                        if iface.get("name") == "lo":
+                            continue
+                        for addr in iface.get("ip-addresses", []):
+                            if addr.get("ip-address-type") == "ipv4":
+                                ip = addr["ip-address"]
+                                if not ip.startswith("127."):
+                                    logger.info(
+                                        "VM %s IP via guest agent: %s (poll #%d)", vmid, ip, poll
+                                    )
+                                    return ip
+                logger.debug(
+                    "VM %s poll #%d guest agent: no routable IPv4 in response", vmid, poll
+                )
+            except Exception as exc:
+                logger.debug("VM %s poll #%d guest agent error: %s", vmid, poll, exc)
+                _drop_client()
+
+            # --- method 2: ARP / neighbour-table fallback ---
+            if mac:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                cmd_timeout = min(_MAX_POLL_CMD_TIMEOUT, max(1, int(remaining)))
+                try:
+                    c = _get_client()
+                    neigh = _exec_via_client(
+                        c,
+                        f"ip neigh show | grep -i {shlex.quote(mac)}",
+                        cmd_timeout,
+                    )
+                    logger.debug("VM %s poll #%d ARP neighbour output: %r", vmid, poll, neigh)
+                    for line in neigh.splitlines():
+                        parts = line.split()
+                        if parts and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
+                            ip = parts[0]
+                            if not ip.startswith("127."):
+                                logger.info(
+                                    "VM %s IP via ARP fallback: %s (poll #%d)", vmid, ip, poll
+                                )
+                                return ip
+                except Exception as exc:
+                    logger.debug("VM %s poll #%d ARP fallback error: %s", vmid, poll, exc)
+                    _drop_client()
+
+            time.sleep(2)
+    finally:
+        _drop_client()
+
+    raise TimeoutError(
+        f"VM {vmid} did not boot with a routable IPv4 address after {timeout}s ({poll} polls) "
+        f"(tried QEMU guest agent and ARP/neighbour-table lookup); "
+        f"check that qemu-guest-agent is installed in the template or that the VM's MAC is visible in 'ip neigh'"
+    )
+
+
 async def wait_for_vm(vmid: int, timeout: int) -> str:
     """Wait for a QEMU VM to obtain a routable IPv4 address.
 
@@ -1298,12 +1484,18 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
     2. **ARP fallback** – looks up the VM's MAC address from ``qm config`` and
        then checks the Proxmox host's neighbour table (``ip neigh show``) for a
        matching entry.  This works even when the guest agent is not installed.
+
+    The polling loop runs in a single ``asyncio.to_thread`` call with one
+    persistent SSH connection to avoid repeated KEX handshakes and SSH server
+    connection throttling.  A hard asyncio-level timeout is applied so a stalled
+    SSH thread can never block the event loop indefinitely.
     """
-    logger.info("Waiting for VM %s to obtain a routable IPv4 address (timeout=%ds)", vmid, timeout)
-    deadline = time.time() + timeout
-    # Fetch the VM's MAC once so we can use it for ARP lookups without an extra
-    # SSH round-trip on every iteration.
-    mac = await get_vm_mac(vmid)
+    # Fetch the VM's MAC once (outside the polling thread) so the ARP fallback
+    # does not need an extra SSH round-trip on every iteration.
+    try:
+        mac = await asyncio.wait_for(get_vm_mac(vmid), timeout=_MAC_LOOKUP_TIMEOUT)
+    except Exception:
+        mac = None
     if mac is None:
         logger.warning(
             "VM %s: could not retrieve MAC address from qm config; ARP fallback will be skipped",
@@ -1311,49 +1503,13 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
         )
     else:
         logger.debug("VM %s MAC address: %s", vmid, mac)
-    poll = 0
-    while time.time() < deadline:
-        poll += 1
-        # --- method 1: QEMU guest agent ---
-        try:
-            output = await run_ssh(f"qm agent {vmid} network-get-interfaces", timeout=15)
-            if output:
-                ifaces = json.loads(output)
-                for iface in ifaces:
-                    if iface.get("name") == "lo":
-                        continue
-                    for addr in iface.get("ip-addresses", []):
-                        if addr.get("ip-address-type") == "ipv4":
-                            ip = addr["ip-address"]
-                            if not ip.startswith("127."):
-                                logger.info("VM %s IP via guest agent: %s (poll #%d)", vmid, ip, poll)
-                                return ip
-                logger.debug("VM %s poll #%d guest agent: no routable IPv4 in response", vmid, poll)
-        except Exception as exc:
-            logger.debug("VM %s poll #%d guest agent error: %s", vmid, poll, exc)
 
-        # --- method 2: ARP / neighbour-table fallback ---
-        if mac:
-            try:
-                neigh = await run_ssh(
-                    f"ip neigh show | grep -i {shlex.quote(mac)}", timeout=15
-                )
-                logger.debug("VM %s poll #%d ARP neighbour output: %r", vmid, poll, neigh)
-                for line in neigh.splitlines():
-                    parts = line.split()
-                    if parts and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
-                        ip = parts[0]
-                        if not ip.startswith("127."):
-                            logger.info("VM %s IP via ARP fallback: %s (poll #%d)", vmid, ip, poll)
-                            return ip
-            except Exception as exc:
-                logger.debug("VM %s poll #%d ARP fallback error: %s", vmid, poll, exc)
-
-        await asyncio.sleep(2)
-    raise TimeoutError(
-        f"VM {vmid} did not boot with a routable IPv4 address after {timeout}s ({poll} polls) "
-        f"(tried QEMU guest agent and ARP/neighbour-table lookup); "
-        f"check that qemu-guest-agent is installed in the template or that the VM's MAC is visible in 'ip neigh'"
+    # Run the blocking polling loop in a thread; apply a hard asyncio-level
+    # safety timeout so a stalled SSH thread can never block indefinitely.
+    hard_timeout = timeout + _SSH_CONNECT_TIMEOUT + _TIMEOUT_BUFFER_SECONDS
+    return await asyncio.wait_for(
+        asyncio.to_thread(_poll_vm_ip_sync, vmid, timeout, mac),
+        timeout=hard_timeout,
     )
 
 
