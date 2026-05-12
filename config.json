@@ -1,18 +1,11 @@
 {
-  "template_id": 9000,
-  "proxmox_host": "192.168.0.10",
-  "node": "pve",
-  "ssh_user": "root",
-  "ssh_known_hosts_path": "/opt/lxchoster/known_hosts",
-  "proxmox_root_password_encrypted": "",
-  "storage": "local-lvm",
   "bridge": "vmbr0",
-  "max_sessions": 25,
-  "session_ttl_seconds": 600,
   "boot_timeout_seconds": 90,
-  "is_gui": false,
-  "gui_vm_username": "",
   "gui_vm_password_encrypted": "",
+  "gui_vm_username": "",
+  "is_gui": false,
+  "is_vm": false,
+  "local_network_allowlist": [],
   "local_network_blocklist": [
     "10.0.0.0/8",
     "172.16.0.0/12",
@@ -22,5 +15,14 @@
     "fc00::/7",
     "fe80::/10"
   ],
-  "local_network_allowlist": []
+  "max_sessions": 25,
+  "node": "pve",
+  "proxmox_host": "192.168.0.10",
+  "proxmox_root_password_encrypted": "",
+  "session_ttl_seconds": 600,
+  "ssh_known_hosts_path": "/opt/lxchoster/known_hosts",
+  "ssh_user": "root",
+  "storage": "local-lvm",
+  "template_id": 9000,
+  "template_id_start": 8000
 }

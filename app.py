@@ -79,6 +79,8 @@ def load_config() -> dict[str, Any]:
     cfg.setdefault("session_ttl_seconds", 600)
     cfg.setdefault("boot_timeout_seconds", 90)
     cfg.setdefault("is_gui", False)
+    cfg.setdefault("is_vm", False)
+    cfg.setdefault("template_id_start", 8000)
     cfg.setdefault("gui_vm_username", "")
     cfg.setdefault(GUI_VM_PASSWORD_KEY, "")
     cfg.setdefault(
@@ -218,7 +220,7 @@ def normalize_client_id(value: str | None) -> str | None:
     return cleaned
 
 
-async def apply_network_restrictions(vmid: int, cfg: dict[str, Any]) -> None:
+async def apply_network_restrictions(vmid: int, cfg: dict[str, Any], is_vm: bool = False) -> None:
     blocklist = [str(item).strip() for item in cfg.get("local_network_blocklist", []) if str(item).strip()]
     allowlist = [str(item).strip() for item in cfg.get("local_network_allowlist", []) if str(item).strip()]
     allow_set = set(allowlist)
@@ -264,7 +266,10 @@ async def apply_network_restrictions(vmid: int, cfg: dict[str, Any]) -> None:
             )
 
     script = "\n".join(lines)
-    await run_ssh(f"pct exec {vmid} -- sh -lc {shlex.quote(script)}", timeout=60)
+    if is_vm:
+        await run_ssh(f"qm guest exec {vmid} -- sh -lc {shlex.quote(script)}", timeout=60)
+    else:
+        await run_ssh(f"pct exec {vmid} -- sh -lc {shlex.quote(script)}", timeout=60)
 
 
 def get_fernet() -> Fernet:
@@ -401,7 +406,11 @@ def ensure_gui_vm_password() -> str:
 
 def active_session_count(state: dict[str, Any]) -> int:
     """Return the number of currently active sessions (creating/running)."""
-    return sum(1 for session in state.values() if session.get("status") in {"creating", "running"})
+    return sum(
+        1
+        for session in state.values()
+        if isinstance(session, dict) and session.get("status") in {"creating", "running"}
+    )
 
 
 def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
@@ -473,7 +482,20 @@ async def run_ssh(remote: str, timeout: int = 60) -> str:
 
 
 async def allocate_vmid() -> int:
-    return int(await run_ssh("pvesh get /cluster/nextid"))
+    cfg = load_config()
+    start_id = int(cfg.get("template_id_start", 8000))
+    with StateLock():
+        state = read_state()
+        used = {int(s["vmid"]) for s in state.values() if isinstance(s, dict) and "vmid" in s}
+        meta = state.get("_meta") if isinstance(state.get("_meta"), dict) else {}
+        last = int(meta.get("last_vmid", start_id - 1))
+        candidate = max(start_id, last + 1)
+        while candidate in used:
+            candidate += 1
+        meta["last_vmid"] = candidate
+        state["_meta"] = meta
+        write_state(state)
+    return candidate
 
 
 async def cleanup_session(session_id: str, reason: str = "cleanup") -> None:
@@ -490,11 +512,20 @@ async def cleanup_session(session_id: str, reason: str = "cleanup") -> None:
         write_state(state)
 
     vmid = int(session["vmid"])
-    for command in (
-        f"pct shutdown {vmid} --timeout 10 || true",
-        f"pct stop {vmid} || true",
-        f"pct destroy {vmid} --purge 1 --destroy-unreferenced-disks 1",
-    ):
+    is_vm = bool(session.get("is_vm", False))
+    if is_vm:
+        cleanup_commands = (
+            f"qm shutdown {vmid} --timeout 10 || true",
+            f"qm stop {vmid} || true",
+            f"qm destroy {vmid} --purge 1",
+        )
+    else:
+        cleanup_commands = (
+            f"pct shutdown {vmid} --timeout 10 || true",
+            f"pct stop {vmid} || true",
+            f"pct destroy {vmid} --purge 1 --destroy-unreferenced-disks 1",
+        )
+    for command in cleanup_commands:
         await run_ssh(command, timeout=120)
 
     with StateLock():
@@ -529,7 +560,54 @@ async def wait_for_container(vmid: int, timeout: int) -> str:
     raise TimeoutError("container did not boot with an IPv4 address")
 
 
-async def start_gui_services(vmid: int, vnc_password: str) -> None:
+async def wait_for_vm(vmid: int, timeout: int) -> str:
+    """Wait for a QEMU VM's guest agent to report a non-loopback IPv4 address."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            output = await run_ssh(f"qm agent {vmid} network-get-interfaces", timeout=15)
+            if output:
+                ifaces = json.loads(output)
+                for iface in ifaces:
+                    if iface.get("name") == "lo":
+                        continue
+                    for addr in iface.get("ip-addresses", []):
+                        if addr.get("ip-address-type") == "ipv4":
+                            ip = addr["ip-address"]
+                            if not ip.startswith("127."):
+                                return ip
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+    raise TimeoutError("VM did not boot with an IPv4 address via guest agent")
+
+
+def open_vm_ssh_client(vm_ip: str, password: str, timeout: int = 30) -> paramiko.SSHClient:
+    """Open a direct paramiko SSH connection to a QEMU VM using root password auth."""
+    client = paramiko.SSHClient()
+    # VM host keys are ephemeral (fresh clone each session); auto-add is acceptable here.
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=vm_ip,
+            username="root",
+            password=password,
+            timeout=timeout,
+            banner_timeout=timeout,
+            auth_timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+    except paramiko.AuthenticationException as exc:
+        client.close()
+        raise RuntimeError(f"SSH authentication failed for root@{vm_ip}.") from exc
+    except (paramiko.SSHException, OSError) as exc:
+        client.close()
+        raise RuntimeError(f"SSH connection to VM {vm_ip} failed: {exc}") from exc
+    return client
+
+
+async def start_gui_services(vmid: int, vnc_password: str, is_vm: bool = False) -> None:
     """Start Xvfb, a desktop environment, and x11vnc inside the container.
 
     The container template must have ``xvfb``, ``x11vnc``, and at least one of
@@ -557,19 +635,29 @@ async def start_gui_services(vmid: int, vnc_password: str) -> None:
         f"x11vnc -storepasswd {vnc_password} /tmp/.vncpw; "
         "nohup x11vnc -display :99 -rfbauth /tmp/.vncpw -forever -rfbport 5900 >/tmp/x11vnc.log 2>&1 &"
     )
-    await run_ssh(f"pct exec {vmid} -- bash -c {shlex.quote(script)}", timeout=30)
+    await run_ssh(
+        f"qm guest exec {vmid} -- bash -c {shlex.quote(script)}" if is_vm
+        else f"pct exec {vmid} -- bash -c {shlex.quote(script)}",
+        timeout=30,
+    )
 
 
-async def wait_for_vnc(vmid: int, timeout: int) -> None:
-    """Poll until x11vnc is listening on port 5900 inside the container."""
+async def wait_for_vnc(vmid: int, timeout: int, is_vm: bool = False) -> None:
+    """Poll until x11vnc is listening on port 5900 inside the container or VM."""
     deadline = time.time() + timeout
+    check_cmd = "ss -tlnp 2>/dev/null | grep -q :5900 && echo ok || true"
     while time.time() < deadline:
         try:
-            out = await run_ssh(
-                f"pct exec {vmid} -- bash -c "
-                "'ss -tlnp 2>/dev/null | grep -q :5900 && echo ok || true'",
-                timeout=10,
-            )
+            if is_vm:
+                out = await run_ssh(
+                    f"qm guest exec {vmid} -- bash -c {shlex.quote(check_cmd)}",
+                    timeout=10,
+                )
+            else:
+                out = await run_ssh(
+                    f"pct exec {vmid} -- bash -c {shlex.quote(check_cmd)}",
+                    timeout=10,
+                )
             if out.strip() == "ok":
                 return
         except Exception:
@@ -598,6 +686,7 @@ async def favicon():
 async def launch(request: Request):
     cfg = load_config()
     is_gui = bool(cfg.get("is_gui", False))
+    is_vm = bool(cfg.get("is_vm", False))
     gui_vm_username = str(cfg.get("gui_vm_username", "")).strip() if is_gui else ""
     gui_vm_password = ensure_gui_vm_password() if is_gui else ""
     password = secrets.token_urlsafe(24)
@@ -646,7 +735,7 @@ async def launch(request: Request):
             ]
             write_session_history(history_rows)
 
-        active = [s for s in state.values() if s.get("status") in {"creating", "running"}]
+        active = [s for s in state.values() if isinstance(s, dict) and s.get("status") in {"creating", "running"}]
         if len(active) >= int(cfg["max_sessions"]):
             raise HTTPException(status_code=429, detail="Maximum active sessions reached.")
 
@@ -664,61 +753,106 @@ async def launch(request: Request):
             "created_at": now,
             "last_seen": now,
             "is_gui": is_gui,
+            "is_vm": is_vm,
             "vnc_password": vnc_password,
         }
         write_state(state)
         upsert_session_history(issued_client_id, session_id, state[session_id], now)
 
     try:
-        await run_ssh(
-            f"pct clone {int(cfg['template_id'])} {vmid} --hostname {hostname} "
-            f"--full 1 --storage {cfg['storage']}",
-            timeout=300,
-        )
-        await run_ssh(
-            f"pct set {vmid} --net0 name=eth0,bridge={cfg['bridge']},ip=dhcp --features nesting=1",
-            timeout=60,
-        )
-        await run_ssh(f"pct start {vmid}", timeout=120)
         password_b64 = base64.b64encode(password.encode()).decode()
-        await run_ssh(
-            f"pct exec {vmid} -- sh -lc '{{ printf root:; printf {password_b64} | base64 -d; printf \"\\n\"; }} | chpasswd'",
-            timeout=60,
-        )
-        if is_gui and gui_vm_username and gui_vm_password:
-            if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
-                gui_pw_b64 = base64.b64encode(gui_vm_password.encode()).decode()
-                await run_ssh(
-                    f"pct exec {vmid} -- sh -lc "
-                    f"'{{ printf {shlex.quote(gui_vm_username)}:; printf {gui_pw_b64} | base64 -d; "
-                    f"printf \"\\n\"; }} | chpasswd'",
-                    timeout=60,
-                )
-            else:
-                logger.warning(
-                    "gui_vm_username %r contains invalid characters; skipping chpasswd",
-                    gui_vm_username,
-                )
-        await apply_network_restrictions(vmid, cfg)
-        ip = await wait_for_container(vmid, int(cfg["boot_timeout_seconds"]))
-        if is_gui:
-            await start_gui_services(vmid, vnc_password)
-            await wait_for_vnc(vmid, int(cfg["boot_timeout_seconds"]))
+        if is_vm:
+            await run_ssh(
+                f"qm clone {int(cfg['template_id'])} {vmid} --name {hostname} --full 1",
+                timeout=300,
+            )
+            await run_ssh(
+                f"qm set {vmid} --net0 model=virtio,bridge={cfg['bridge']},firewall=0",
+                timeout=60,
+            )
+            await run_ssh(f"qm start {vmid}", timeout=120)
+            ip = await wait_for_vm(vmid, int(cfg["boot_timeout_seconds"]))
+            vm_chpasswd = (
+                f"{{ printf root:; printf {password_b64} | base64 -d; printf '\\n'; }} | chpasswd"
+            )
+            await run_ssh(
+                f"qm guest exec {vmid} -- sh -lc {shlex.quote(vm_chpasswd)}",
+                timeout=60,
+            )
+            if is_gui and gui_vm_username and gui_vm_password:
+                if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
+                    gui_pw_b64 = base64.b64encode(gui_vm_password.encode()).decode()
+                    vm_gui_chpasswd = (
+                        f"{{ printf {shlex.quote(gui_vm_username)}:; "
+                        f"printf {gui_pw_b64} | base64 -d; printf '\\n'; }} | chpasswd"
+                    )
+                    await run_ssh(
+                        f"qm guest exec {vmid} -- sh -lc {shlex.quote(vm_gui_chpasswd)}",
+                        timeout=60,
+                    )
+                else:
+                    logger.warning(
+                        "gui_vm_username %r contains invalid characters; skipping chpasswd",
+                        gui_vm_username,
+                    )
+            await apply_network_restrictions(vmid, cfg, is_vm=True)
+            if is_gui:
+                await start_gui_services(vmid, vnc_password, is_vm=True)
+                await wait_for_vnc(vmid, int(cfg["boot_timeout_seconds"]), is_vm=True)
+        else:
+            await run_ssh(
+                f"pct clone {int(cfg['template_id'])} {vmid} --hostname {hostname} "
+                f"--full 1 --storage {cfg['storage']}",
+                timeout=300,
+            )
+            await run_ssh(
+                f"pct set {vmid} --net0 name=eth0,bridge={cfg['bridge']},ip=dhcp --features nesting=1",
+                timeout=60,
+            )
+            await run_ssh(f"pct start {vmid}", timeout=120)
+            await run_ssh(
+                f"pct exec {vmid} -- sh -lc "
+                f"'{{ printf root:; printf {password_b64} | base64 -d; printf \"\\n\"; }} | chpasswd'",
+                timeout=60,
+            )
+            if is_gui and gui_vm_username and gui_vm_password:
+                if GUI_VM_USERNAME_PATTERN.fullmatch(gui_vm_username):
+                    gui_pw_b64 = base64.b64encode(gui_vm_password.encode()).decode()
+                    await run_ssh(
+                        f"pct exec {vmid} -- sh -lc "
+                        f"'{{ printf {shlex.quote(gui_vm_username)}:; printf {gui_pw_b64} | base64 -d; "
+                        f"printf \"\\n\"; }} | chpasswd'",
+                        timeout=60,
+                    )
+                else:
+                    logger.warning(
+                        "gui_vm_username %r contains invalid characters; skipping chpasswd",
+                        gui_vm_username,
+                    )
+            await apply_network_restrictions(vmid, cfg, is_vm=False)
+            ip = await wait_for_container(vmid, int(cfg["boot_timeout_seconds"]))
+            if is_gui:
+                await start_gui_services(vmid, vnc_password, is_vm=False)
+                await wait_for_vnc(vmid, int(cfg["boot_timeout_seconds"]), is_vm=False)
     except Exception as exc:
         await cleanup_session(session_id, f"create_failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
     with StateLock():
         state = read_state()
-        state[session_id].update({"status": "running", "ip": ip, "last_seen": int(time.time())})
+        update = {"status": "running", "ip": ip, "last_seen": int(time.time())}
+        if is_vm:
+            update["vm_root_password"] = password
+        state[session_id].update(update)
         write_state(state)
         upsert_session_history(issued_client_id, session_id, state[session_id], int(time.time()))
         logger.info(
-            "Session created id=%s vmid=%s hostname=%s is_gui=%s active_sessions=%d",
+            "Session created id=%s vmid=%s hostname=%s is_gui=%s is_vm=%s active_sessions=%d",
             session_id,
             vmid,
             hostname,
             is_gui,
+            is_vm,
             active_session_count(state),
         )
     payload = {"session_id": session_id, "vmid": vmid, "hostname": hostname, "ip": ip, "reused": False, "is_gui": is_gui}
@@ -750,7 +884,15 @@ async def terminal(websocket: WebSocket, session_id: str):
 
     vmid = int(session["vmid"])
     client_id = str(session.get("client_id", ""))
-    client = await asyncio.to_thread(open_ssh_client, 10)
+    is_vm = bool(session.get("is_vm", False))
+
+    if is_vm:
+        vm_ip = str(session.get("ip", ""))
+        vm_password = str(session.get("vm_root_password", ""))
+        client = await asyncio.to_thread(open_vm_ssh_client, vm_ip, vm_password, 30)
+    else:
+        client = await asyncio.to_thread(open_ssh_client, 10)
+
     transport = client.get_transport()
     if transport is None:
         logger.error("Failed to open SSH transport for session_id=%s vmid=%s", session_id, vmid)
@@ -759,7 +901,10 @@ async def terminal(websocket: WebSocket, session_id: str):
         return
     channel = await asyncio.to_thread(transport.open_session, timeout=10)
     await asyncio.to_thread(channel.get_pty, term="xterm", width=80, height=24)
-    await asyncio.to_thread(channel.exec_command, f"pct exec {vmid} -- bash -l")
+    if is_vm:
+        await asyncio.to_thread(channel.invoke_shell)
+    else:
+        await asyncio.to_thread(channel.exec_command, f"pct exec {vmid} -- bash -l")
 
     async def pty_to_ws():
         while True:
