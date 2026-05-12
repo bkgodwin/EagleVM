@@ -60,7 +60,11 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="LXChoster", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+_log_level_raw = os.environ.get("LOG_LEVEL", "INFO").upper()
+# Set LOG_LEVEL=DEBUG in the environment for verbose command-level and poll-level logging.
+_log_level = _log_level_raw if _log_level_raw in _VALID_LOG_LEVELS else "INFO"
+logging.basicConfig(level=_log_level, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("lxchoster")
 _PROXMOX_PASSWORD_CACHE: str | None = None
 _GUI_VM_PASSWORD_CACHE: str | None = None
@@ -455,6 +459,7 @@ def open_ssh_client(timeout: int = 10) -> paramiko.SSHClient:
 
 
 def ssh_cmd(remote: str, timeout: int = 60) -> str:
+    logger.debug("SSH cmd (timeout=%ds): %s", timeout, remote)
     client = open_ssh_client(timeout=timeout)
     try:
         _, stdout, stderr = client.exec_command(remote, timeout=timeout)
@@ -469,7 +474,9 @@ def ssh_cmd(remote: str, timeout: int = 60) -> str:
     finally:
         client.close()
     if exit_code:
+        logger.debug("SSH cmd failed (exit=%d) stderr=%r stdout=%r cmd=%s", exit_code, err, out, remote)
         raise RuntimeError(err or out or f"remote command failed with exit code {exit_code}")
+    logger.debug("SSH cmd ok (exit=0) output=%r", out)
     return out
 
 
@@ -549,16 +556,26 @@ async def cleanup_session(session_id: str, reason: str = "cleanup") -> None:
 
 
 async def wait_for_container(vmid: int, timeout: int) -> str:
+    logger.info("Waiting for container %s to obtain an IP address (timeout=%ds)", vmid, timeout)
     deadline = time.time() + timeout
+    poll = 0
     while time.time() < deadline:
+        poll += 1
         try:
             output = await run_ssh(f"pct exec {vmid} -- hostname -I", timeout=15)
+            logger.debug("Container %s poll #%d hostname -I output: %r", vmid, poll, output)
             if output:
-                return output.split()[0].strip()
-        except Exception:
-            pass
+                ip = output.split()[0].strip()
+                logger.info("Container %s obtained IP %s after %d poll(s)", vmid, ip, poll)
+                return ip
+            logger.debug("Container %s poll #%d: hostname -I returned empty (no IP yet)", vmid, poll)
+        except Exception as exc:
+            logger.debug("Container %s poll #%d error: %s", vmid, poll, exc)
         await asyncio.sleep(2)
-    raise TimeoutError("container did not boot with an IPv4 address")
+    raise TimeoutError(
+        f"container {vmid} did not boot with an IPv4 address after {timeout}s ({poll} polls); "
+        f"check that the template has a DHCP-capable network interface and that the bridge is correct"
+    )
 
 
 async def get_vm_mac(vmid: int) -> str | None:
@@ -587,6 +604,7 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
        then checks the Proxmox host's neighbour table (``ip neigh show``) for a
        matching entry.  This works even when the guest agent is not installed.
     """
+    logger.info("Waiting for VM %s to obtain a routable IPv4 address (timeout=%ds)", vmid, timeout)
     deadline = time.time() + timeout
     # Fetch the VM's MAC once so we can use it for ARP lookups without an extra
     # SSH round-trip on every iteration.
@@ -596,7 +614,11 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
             "VM %s: could not retrieve MAC address from qm config; ARP fallback will be skipped",
             vmid,
         )
+    else:
+        logger.debug("VM %s MAC address: %s", vmid, mac)
+    poll = 0
     while time.time() < deadline:
+        poll += 1
         # --- method 1: QEMU guest agent ---
         try:
             output = await run_ssh(f"qm agent {vmid} network-get-interfaces", timeout=15)
@@ -609,10 +631,11 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
                         if addr.get("ip-address-type") == "ipv4":
                             ip = addr["ip-address"]
                             if not ip.startswith("127."):
-                                logger.info("VM %s IP via guest agent: %s", vmid, ip)
+                                logger.info("VM %s IP via guest agent: %s (poll #%d)", vmid, ip, poll)
                                 return ip
-        except Exception:
-            pass
+                logger.debug("VM %s poll #%d guest agent: no routable IPv4 in response", vmid, poll)
+        except Exception as exc:
+            logger.debug("VM %s poll #%d guest agent error: %s", vmid, poll, exc)
 
         # --- method 2: ARP / neighbour-table fallback ---
         if mac:
@@ -620,20 +643,22 @@ async def wait_for_vm(vmid: int, timeout: int) -> str:
                 neigh = await run_ssh(
                     f"ip neigh show | grep -i {shlex.quote(mac)}", timeout=15
                 )
+                logger.debug("VM %s poll #%d ARP neighbour output: %r", vmid, poll, neigh)
                 for line in neigh.splitlines():
                     parts = line.split()
                     if parts and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
                         ip = parts[0]
                         if not ip.startswith("127."):
-                            logger.info("VM %s IP via ARP fallback: %s", vmid, ip)
+                            logger.info("VM %s IP via ARP fallback: %s (poll #%d)", vmid, ip, poll)
                             return ip
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("VM %s poll #%d ARP fallback error: %s", vmid, poll, exc)
 
         await asyncio.sleep(2)
     raise TimeoutError(
-        "VM did not boot with a routable IPv4 address "
-        "(tried QEMU guest agent and ARP/neighbour-table lookup)"
+        f"VM {vmid} did not boot with a routable IPv4 address after {timeout}s ({poll} polls) "
+        f"(tried QEMU guest agent and ARP/neighbour-table lookup); "
+        f"check that qemu-guest-agent is installed in the template or that the VM's MAC is visible in 'ip neigh'"
     )
 
 
@@ -823,16 +848,20 @@ async def launch(request: Request):
         password_b64 = base64.b64encode(password.encode()).decode()
         if is_vm:
             vm_boot_timeout = int(cfg["vm_boot_timeout_seconds"])
+            logger.info("Session %s: cloning VM template %s -> vmid %s", session_id, cfg['template_id'], vmid)
             await run_ssh(
                 f"qm clone {int(cfg['template_id'])} {vmid} --name {hostname} --full 1",
                 timeout=300,
             )
+            logger.info("Session %s: configuring network for vmid %s", session_id, vmid)
             await run_ssh(
                 f"qm set {vmid} --net0 model=virtio,bridge={cfg['bridge']},firewall=0",
                 timeout=60,
             )
+            logger.info("Session %s: starting vmid %s", session_id, vmid)
             await run_ssh(f"qm start {vmid}", timeout=120)
             ip = await wait_for_vm(vmid, vm_boot_timeout)
+            logger.info("Session %s: setting root password on vmid %s", session_id, vmid)
             vm_chpasswd = (
                 f"{{ printf root:; printf {password_b64} | base64 -d; printf '\\n'; }} | chpasswd"
             )
@@ -856,21 +885,27 @@ async def launch(request: Request):
                         "gui_vm_username %r contains invalid characters; skipping chpasswd",
                         gui_vm_username,
                     )
+            logger.info("Session %s: applying network restrictions to vmid %s", session_id, vmid)
             await apply_network_restrictions(vmid, cfg, is_vm=True)
             if is_gui:
+                logger.info("Session %s: starting GUI services on vmid %s", session_id, vmid)
                 await start_gui_services(vmid, vnc_password, is_vm=True)
                 await wait_for_vnc(vmid, vm_boot_timeout, is_vm=True)
         else:
+            logger.info("Session %s: cloning LXC template %s -> vmid %s", session_id, cfg['template_id'], vmid)
             await run_ssh(
                 f"pct clone {int(cfg['template_id'])} {vmid} --hostname {hostname} "
                 f"--full 1 --storage {cfg['storage']}",
                 timeout=300,
             )
+            logger.info("Session %s: configuring network for vmid %s", session_id, vmid)
             await run_ssh(
                 f"pct set {vmid} --net0 name=eth0,bridge={cfg['bridge']},ip=dhcp --features nesting=1",
                 timeout=60,
             )
+            logger.info("Session %s: starting vmid %s", session_id, vmid)
             await run_ssh(f"pct start {vmid}", timeout=120)
+            logger.info("Session %s: setting root password on vmid %s", session_id, vmid)
             await run_ssh(
                 f"pct exec {vmid} -- sh -lc "
                 f"'{{ printf root:; printf {password_b64} | base64 -d; printf \"\\n\"; }} | chpasswd'",
@@ -890,12 +925,15 @@ async def launch(request: Request):
                         "gui_vm_username %r contains invalid characters; skipping chpasswd",
                         gui_vm_username,
                     )
+            logger.info("Session %s: applying network restrictions to vmid %s", session_id, vmid)
             await apply_network_restrictions(vmid, cfg, is_vm=False)
             ip = await wait_for_container(vmid, int(cfg["boot_timeout_seconds"]))
             if is_gui:
+                logger.info("Session %s: starting GUI services on vmid %s", session_id, vmid)
                 await start_gui_services(vmid, vnc_password, is_vm=False)
                 await wait_for_vnc(vmid, int(cfg["boot_timeout_seconds"]), is_vm=False)
     except Exception as exc:
+        logger.error("Session %s creation failed: %s", session_id, exc, exc_info=True)
         await cleanup_session(session_id, f"create_failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -1180,10 +1218,12 @@ async def cleanup_loop():
                 for sid, session in state.items()
                 if session.get("status") in {"creating", "running"} and int(session.get("last_seen", 0)) < cutoff
             ]
+            if stale:
+                logger.info("Cleanup loop: found %d stale session(s): %s", len(stale), stale)
             for sid in stale:
                 await cleanup_session(sid, "timeout")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Cleanup loop error: %s", exc)
         await asyncio.sleep(30)
 
 
