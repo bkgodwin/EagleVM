@@ -262,6 +262,10 @@ def build_startup_state(
     }
 
 
+def queued_startup_state(message: str = "Queued to start your session.") -> dict[str, Any]:
+    return build_startup_state("queued", message, 0)
+
+
 def build_gui_tunnel_state(state: str, message: str, **extra: Any) -> dict[str, Any]:
     payload = {"state": state, "message": message, "updated_at": int(time.time())}
     payload.update(extra)
@@ -321,7 +325,7 @@ def serialize_session_payload(
         "ready": session.get("status") == "running" and bool(session.get("ip")),
         "is_gui": bool(session.get("is_gui", False)),
         "is_vm": bool(session.get("is_vm", False)),
-        "startup": build_startup_state("queued", "Queued to start your session.", 0),
+        "startup": queued_startup_state(),
     }
     startup = session.get("startup")
     if isinstance(startup, dict):
@@ -955,7 +959,6 @@ async def provision_session(session_id: str) -> None:
         "message": "Queued to start your session.",
         "phase_started_at": time.time(),
     }
-    set_session_startup(session_id, "queued", "Queued to start your session.", 0, error=None)
 
     try:
         if is_vm:
@@ -1510,7 +1513,7 @@ async def launch(request: Request):
             "is_gui": is_gui,
             "is_vm": is_vm,
             "vnc_password": vnc_password,
-            "startup": build_startup_state("queued", "Queued to start your session.", 0),
+            "startup": queued_startup_state(),
         }
         write_state(state)
         upsert_session_history(issued_client_id, session_id, state[session_id], now)
