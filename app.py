@@ -285,7 +285,7 @@ async def apply_network_restrictions(
 
 
 def resolve_host_ipv4_addrs(host: str) -> list[str]:
-    """Resolve a host to IPv4 addresses, returning unique values in order."""
+    """Resolve a host to unique IPv4 strings in order; return [] on empty/unresolvable input."""
     resolved: list[str] = []
     host_value = host.strip()
     if not host_value:
@@ -297,7 +297,8 @@ def resolve_host_ipv4_addrs(host: str) -> list[str]:
         return resolved
     seen: set[str] = set()
     for info in infos:
-        addr = info[4][0]
+        _, _, _, _, sockaddr = info
+        addr = sockaddr[0]
         if addr not in seen:
             seen.add(addr)
             resolved.append(addr)
@@ -1158,12 +1159,15 @@ async def gui_session(websocket: WebSocket, session_id: str):
     container_ip = str(session["ip"])
     client_id = str(session.get("client_id", ""))
     vnc_target = (container_ip, 5900)
-    disconnect_info: dict[str, str | None] = {"side": None, "reason": None}
+    disconnect_side: str | None = None
+    disconnect_reason: str | None = None
 
-    def note_disconnect(side: str, reason: str) -> None:
-        if disconnect_info["side"] is None:
-            disconnect_info["side"] = side
-            disconnect_info["reason"] = reason
+    def record_first_disconnect(side: str, reason: str) -> None:
+        """Record the first disconnect source ('ssh' or 'websocket') and reason only once."""
+        nonlocal disconnect_side, disconnect_reason
+        if disconnect_side is None:
+            disconnect_side = side
+            disconnect_reason = reason
 
     client = await asyncio.to_thread(open_ssh_client, 10)
     transport = client.get_transport()
@@ -1210,13 +1214,13 @@ async def gui_session(websocket: WebSocket, session_id: str):
             if await asyncio.to_thread(channel.recv_ready):
                 data = await asyncio.to_thread(channel.recv, 16384)
                 if not data:
-                    note_disconnect("ssh", "vnc channel EOF")
+                    record_first_disconnect("ssh", "vnc channel EOF")
                     break
                 if (
                     websocket.application_state != WebSocketState.CONNECTED
                     or websocket.client_state != WebSocketState.CONNECTED
                 ):
-                    note_disconnect("websocket", "websocket no longer connected while sending VNC data")
+                    record_first_disconnect("websocket", "websocket no longer connected while sending VNC data")
                     break
                 try:
                     await websocket.send_bytes(data)
@@ -1225,12 +1229,12 @@ async def gui_session(websocket: WebSocket, session_id: str):
                         websocket.application_state != WebSocketState.CONNECTED
                         or websocket.client_state != WebSocketState.CONNECTED
                     ):
-                        note_disconnect("websocket", "websocket closed while sending VNC data")
+                        record_first_disconnect("websocket", "websocket closed while sending VNC data")
                         break
                     raise
                 continue
             if await asyncio.to_thread(lambda: channel.closed):
-                note_disconnect("ssh", "vnc channel closed")
+                record_first_disconnect("ssh", "vnc channel closed")
                 break
             await asyncio.sleep(0.1)
 
@@ -1239,10 +1243,10 @@ async def gui_session(websocket: WebSocket, session_id: str):
             try:
                 msg = await websocket.receive()
             except WebSocketDisconnect as exc:
-                note_disconnect("websocket", f"websocket disconnect code={exc.code}")
+                record_first_disconnect("websocket", f"websocket disconnect code={exc.code}")
                 break
             if msg.get("type") != "websocket.receive":
-                note_disconnect("websocket", f"websocket message type={msg.get('type')}")
+                record_first_disconnect("websocket", f"websocket message type={msg.get('type')}")
                 break
             with StateLock():
                 state = read_state()
@@ -1258,7 +1262,7 @@ async def gui_session(websocket: WebSocket, session_id: str):
                 try:
                     await asyncio.to_thread(channel.send, data)
                 except Exception as exc:
-                    note_disconnect("ssh", f"channel send failed: {exc}")
+                    record_first_disconnect("ssh", f"channel send failed: {exc}")
                     raise
 
     ws_task = asyncio.create_task(ws_to_vnc())
@@ -1275,8 +1279,8 @@ async def gui_session(websocket: WebSocket, session_id: str):
         logger.debug(
             "GUI tunnel completed session_id=%s first_disconnect_side=%s reason=%s completed_tasks=%s",
             session_id,
-            disconnect_info["side"] or "unknown",
-            disconnect_info["reason"] or "not recorded",
+            disconnect_side or "unknown",
+            disconnect_reason or "not recorded",
             ",".join(completed_names) or "none",
         )
         for task in pending_tasks:
@@ -1287,14 +1291,14 @@ async def gui_session(websocket: WebSocket, session_id: str):
             if exc and not isinstance(exc, WebSocketDisconnect):
                 raise exc
     except WebSocketDisconnect as exc:
-        note_disconnect("websocket", f"websocket disconnect code={exc.code}")
+        record_first_disconnect("websocket", f"websocket disconnect code={exc.code}")
         pass
     finally:
         logger.debug(
             "GUI tunnel teardown session_id=%s first_disconnect_side=%s reason=%s channel_closed=%s ws_app_state=%s ws_client_state=%s",
             session_id,
-            disconnect_info["side"] or "unknown",
-            disconnect_info["reason"] or "not recorded",
+            disconnect_side or "unknown",
+            disconnect_reason or "not recorded",
             channel.closed,
             websocket.application_state,
             websocket.client_state,
