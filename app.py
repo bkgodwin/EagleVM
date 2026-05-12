@@ -3,6 +3,7 @@ import base64
 import csv
 import fcntl
 import getpass
+import ipaddress
 import json
 import logging
 import os
@@ -308,14 +309,23 @@ def resolve_host_ipv4_addrs(host: str) -> list[str]:
 async def resolve_route_source_ipv4(destination: str) -> str | None:
     """Return the Proxmox host IPv4 source address used to reach ``destination``."""
     try:
-        output = await run_ssh(f"ip -4 route get {shlex.quote(destination)}", timeout=15)
+        destination_ip = str(ipaddress.IPv4Address(destination))
+    except ipaddress.AddressValueError:
+        logger.warning("Could not resolve route source IP for invalid destination %r", destination)
+        return None
+    try:
+        output = await run_ssh(f"ip -4 route get {shlex.quote(destination_ip)}", timeout=15)
     except Exception as exc:
-        logger.warning("Could not resolve route source IP for %s: %s", destination, exc)
+        logger.warning("Could not resolve route source IP for %s: %s", destination_ip, exc)
         return None
     match = re.search(r"\bsrc (\d+\.\d+\.\d+\.\d+)\b", output)
     if match:
-        return match.group(1)
-    logger.warning("Could not parse route source IP for %s from %r", destination, output)
+        try:
+            return str(ipaddress.IPv4Address(match.group(1)))
+        except ipaddress.AddressValueError:
+            logger.warning("Could not parse valid route source IP for %s from %r", destination_ip, output)
+            return None
+    logger.warning("Could not parse route source IP for %s from %r", destination_ip, output)
     return None
 
 
